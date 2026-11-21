@@ -1004,6 +1004,7 @@ async function main() {
   const child = spawnClaude(claude.command, childArgs, {
     env: withClaudeOnPath(
       { ...claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
+        CCC_RECALL_PROXY_URL: `http://127.0.0.1:${proxy.port}`, CCC_RECALL_ACCOUNT: memtree.storageIdentity,
         [RECALL_WRAPPED]: "1", [RECALL_ACTIVE]: visibleRecall && noticePlugin ? "1" : "0" },
       claude
     ),

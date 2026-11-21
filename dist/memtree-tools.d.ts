@@ -61,7 +61,8 @@ export declare class MemtreeIndex {
     lineTime(block: number, line: number): string | undefined;
     get blockCount(): number;
     blockLines(block: number): string[] | undefined;
-    /** Representative source lines beneath a summary, including branch reads. */
+    sessionTime(): unknown;
+    /** Representative lines for search hits with a summary and no snippets. */
     recallLines(id: number): Iterable<string>;
     /** Root first, the node's parent last. */
     ancestors(id: number): number[];

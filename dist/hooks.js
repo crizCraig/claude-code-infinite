@@ -679,9 +679,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     if (opts.subagentResult)
         hooks.PostToolUse = [subagentResultHook(hookUrl)];
     if (opts.recall) {
-        hooks.PostToolUse = [...(hooks.PostToolUse ?? []), {
-                matcher: RECALL_MATCHER, hooks: [{ ...hook, url: hookUrl + RECALL_HOOK_SUFFIX }],
-            }];
+        const receiptHook = { matcher: RECALL_MATCHER, hooks: [{ ...hook, url: hookUrl + RECALL_HOOK_SUFFIX }] };
+        hooks.PreToolUse = [receiptHook];
+        hooks.PostToolUse = [...(hooks.PostToolUse ?? []), receiptHook];
     }
     if (opts.interceptCompact !== false) {
         hooks.PreCompact = [{ matcher: "manual", hooks: [compactHook] }];

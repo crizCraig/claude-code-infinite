@@ -100,7 +100,10 @@ export class MemtreeIndex {
     blockLines(block) {
         return this.lines[block];
     }
-    /** Representative source lines beneath a summary, including branch reads. */
+    sessionTime() {
+        return this.times.get(0)?.[0] ?? this.page.tree_created_at ?? this.page.created_at;
+    }
+    /** Representative lines for search hits with a summary and no snippets. */
     *recallLines(id) {
         const seen = new Set();
         const stack = [id];
@@ -341,11 +344,12 @@ treeTimes, session, index) {
         throw new ToolInputError("search: the query has no searchable terms");
     collectRecalls(() => {
         for (const hit of hits) {
-            recallPassage(session, hit.summary, hit.times?.[0] ?? treeTimes?.[0] ?? index?.page.tree_created_at, hit.snippets.length ? hit.snippets.map(s => s.text) : index?.recallLines(hit.id) ?? [], hit.times?.[0]);
+            const at = hit.times?.[0] ?? hit.snippets.find(s => s.at)?.at ?? treeTimes?.[0] ?? index?.sessionTime();
+            recallPassage(session, hit.summary, at, hit.snippets.length ? hit.snippets.map(s => s.text) : index?.recallLines(hit.id) ?? [], hit.times?.[0]);
         }
         for (const hit of tailHits) {
             if (hit.snippets.length)
-                recallPassage(session, "", hit.at, hit.snippets.map(s => s.text));
+                recallPassage(session, "", hit.at ?? treeTimes?.[0] ?? index?.sessionTime(), hit.snippets.map(s => s.text));
         }
     });
     if (!hits.length && tailHits.length) {
@@ -402,11 +406,6 @@ export function formatNode(index, id, tree) {
     if (!node) {
         throw new ToolInputError(`read_node: no node ${id} (this tree has ${index.nodes.size} nodes; node 0 is the root)`);
     }
-    collectRecalls(() => {
-        if (!node.s?.trim() && !node.k?.length && !node.l)
-            return;
-        recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.page.tree_created_at, index.recallLines(id), index.times.get(id)?.[0]);
-    });
     const missing = new MissingTimeNote();
     const out = [
         `node ${id} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
@@ -438,6 +437,14 @@ export function formatNode(index, id, tree) {
             out.push(`  node ${child} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
         }
     }
+    collectRecalls(() => {
+        // Only summary text this answer actually returns can establish a current-session recall.
+        const related = [...path, ...children].map(n => truncate(index.nodes.get(n)?.s ?? "", SUMMARY_CHARS));
+        const summaries = [node.s ?? "", ...related];
+        if (summaries.some(s => s.trim())) {
+            recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.sessionTime(), summaries);
+        }
+    });
     return out.join("\n");
 }
 /**
@@ -510,7 +517,7 @@ export function formatLines(index, block, start, end, tree) {
         if (!excerpts.length)
             return;
         const leaf = Array.from(index.nodes.values()).find(n => n.l?.[0] === block && n.l[1] <= start && n.l[2] >= start);
-        recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title, index.rangeSpan(block, start, shown)?.[0] ?? index.page.tree_created_at, excerpts);
+        recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title, index.rangeSpan(block, start, shown)?.[0] ?? index.sessionTime(), excerpts);
     });
     const wanted = Math.min(end, lines.length);
     if (shown < wanted) {
@@ -598,8 +605,10 @@ export function formatTail(body, tree) {
     }
     collectRecalls(() => {
         const useful = messages.filter(m => typeof m.x === "string" && m.x.trim());
-        if (useful.length)
-            recallPassage(page.session_id, page.title, useful[0].at, useful.map(m => m.x));
+        if (useful.length) {
+            const at = useful.find(m => m.at)?.at ?? messages.find(m => m.at)?.at ?? page.tree_created_at ?? page.created_at;
+            recallPassage(page.session_id, page.title, at, useful.map(m => m.x));
+        }
     });
     const first = messages[0].i;
     const last = messages[messages.length - 1].i;

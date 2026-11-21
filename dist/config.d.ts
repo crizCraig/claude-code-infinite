@@ -30,4 +30,6 @@ export declare function getLocalPolychatApiKey(): string | undefined;
 export declare function setLocalPolychatApiKey(key: string): void;
 /** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
 export declare function memtreeBaseUrlFor(mode: CccEnvironment, env?: NodeJS.ProcessEnv): string;
+/** Namespace local state by backend and account, without persisting the credential. */
+export declare function memtreeStorageIdentity(baseUrl: string, apiKey: string): string;
 //# sourceMappingURL=config.d.ts.map

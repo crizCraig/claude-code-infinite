@@ -118,8 +118,10 @@ In interactive Claude Code, a successful recall gets one line at the end of the 
 
 The line names the first qualifying passage and counts the others. A read of the
 current session qualifies when ccc can verify that source text disappeared from
-the request sent to Claude during compression. An undated past session is labeled
-“a past session.” The exit summary counts past-session passages across resumes.
+the request sent to Claude during compression. Past-session dates use your local
+calendar. An undated past session is labeled “a past session.” If a background
+agent recalls something after its parent stops, the next Stop in that session
+shows the notice. The exit summary counts past-session passages across resumes.
 Set `CCC_RECALL_NOTICE=0` to turn off recall notices and counting.
 
 ### Read ccc sessions from Codex or another MCP client
@@ -159,8 +161,10 @@ to find a tree or session id, then pass it to the read tools. Direct mode has no
 
 When launching plain Claude Code with the direct MCP registration, also merge
 the output of `ccc memtree-mcp --print-config --format claude-hooks` into your
-Claude Code settings, or save it as a file and pass `--settings <file>` to Claude Code. This registers the display hooks. Interactive `ccc` installs
-them for its session automatically, including when you supply a direct MCP config.
+Claude Code settings, or save it as a file and pass `--settings <file>` to Claude
+Code. For a staging registration, add `--env staging` when generating the hooks
+too. Interactive `ccc` installs them for its session automatically, including
+when you supply a direct MCP config.
 The synchronous Stop hook emits only a user-facing `systemMessage`. The MCP
 result and subsequent model requests carry the same content with notices on or off.
 

@@ -11,8 +11,16 @@ export interface RecallHook {
     session_id?: string;
     prompt_id?: string;
     agent_id?: string;
+    tool_response?: unknown;
 }
-export declare function withRecallReceipt(tool: string, id: unknown, answer: () => Promise<string>): Promise<string>;
+export interface RecallInvocation {
+    account: string;
+    session: string;
+    /** stdio sends the unmodified answer before publishing its receipt. */
+    afterReply?: (write: () => Promise<void>) => void;
+}
+export declare function beginRecall(input: RecallHook, account: string): Promise<void>;
+export declare function withRecallReceipt(tool: string, id: unknown, answer: () => Promise<string>, invocation?: RecallInvocation): Promise<string>;
 export declare function recallPassage(session: unknown, summary: unknown, at: unknown, excerpts: Iterable<string>, sourceTime?: string): void;
 export interface RecallContext {
     original: Buffer;
@@ -21,17 +29,18 @@ export interface RecallContext {
     sourceAt?: (at: string) => Iterable<string>;
 }
 export interface RecallBatch {
+    session: string;
     label: string;
     at?: string;
     firstPast: boolean;
     count: number;
     past: number;
 }
-export declare function recalled(input: RecallHook, context?: RecallContext): RecallBatch | undefined;
+export declare function recalled(input: RecallHook, context: RecallContext | undefined, account: string): Promise<RecallBatch | undefined>;
 export declare function pastRecallCount(session?: string): number;
 export declare function recallLine(batches: RecallBatch[], now?: Date): string | undefined;
-/** Plain Claude Code has no ccc proxy to own a turn. One file per tool
- * handles parallel calls; an exclusive marker lets only one Stop claim it. */
-export declare function standaloneRecall(input: RecallHook): string | undefined;
+/** Only the matching prompt owns host calls. Background agents can finish after
+ * that prompt's Stop, so the next parent Stop in the same session can claim them. */
+export declare function standaloneRecall(input: RecallHook, account: string): Promise<string | undefined>;
 export declare function standaloneRecallHook(): Promise<void>;
 //# sourceMappingURL=recall.d.ts.map

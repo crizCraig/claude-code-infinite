@@ -90,8 +90,9 @@ export function formatDirectMcpConfig(
 ): string {
   if (format === "claude-hooks") {
     // Claude Code exec-form hooks preserve Windows paths (and shell metacharacters).
-    const hook = { type: "command", command, args: [cli, "recall-hook"], timeout: 5 };
+    const hook = { type: "command", command, args: mode === "staging" ? [cli, "recall-hook", mode] : [cli, "recall-hook"], timeout: 5 };
     return JSON.stringify({ env: { [RECALL_ACTIVE]: "1" }, hooks: {
+      PreToolUse: [{ matcher: RECALL_MATCHER, hooks: [hook] }],
       PostToolUse: [{ matcher: RECALL_MATCHER, hooks: [hook] }], Stop: [{ hooks: [hook] }],
     } }, null, 2);
   }
@@ -118,7 +119,7 @@ export function printDirectMcpConfig(args: string[], defaultEnv: CccEnvironment)
   }
   const format = values?.format ?? "codex";
   const mode = values?.env ?? defaultEnv;
-  if (!values || (format !== "json" && format !== "codex") || (mode !== "production" && mode !== "staging")) {
+  if (!values || (format !== "json" && format !== "codex" && format !== "claude-hooks") || (mode !== "production" && mode !== "staging")) {
     console.error("Usage: ccc memtree-mcp --print-config [--format codex|json|claude-hooks] [--env staging|production]");
     return 1;
   }

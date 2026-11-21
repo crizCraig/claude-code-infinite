@@ -362,15 +362,18 @@ interface MemtreePage {
     compressed: boolean;
     seq: number;
 }
+interface SessionRecalls {
+    prompt?: string;
+    contexts: Map<string | undefined, RecallContext>;
+    agents: Set<string>;
+    pending: {
+        agent?: string;
+        batch: Promise<RecallBatch | undefined>;
+    }[];
+}
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
-    recall?: {
-        session?: string;
-        prompt?: string;
-        contexts: Map<string | undefined, RecallContext>;
-        agents: Set<string>;
-        batches: RecallBatch[];
-    };
+    recall?: Map<string, SessionRecalls>;
     /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
     threadRefusals: ThreadRefusals;
     /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */

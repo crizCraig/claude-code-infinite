@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CccEnvironment } from "./cli-args.js";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -126,4 +127,10 @@ export function memtreeBaseUrlFor(mode: CccEnvironment, env: NodeJS.ProcessEnv =
   return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
     mode === "staging" ? STAGING_BASE_URL :
     POLYCHAT_BASE_URL;
+}
+
+/** Namespace local state by backend and account, without persisting the credential. */
+export function memtreeStorageIdentity(baseUrl: string, apiKey: string): string {
+  const keyHash = createHash("sha256").update(apiKey).digest("hex");
+  return createHash("sha256").update(baseUrl + "\n" + keyHash).digest("hex");
 }

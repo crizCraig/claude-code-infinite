@@ -37,15 +37,15 @@
  * endpoint.
  */
 import https from "node:https";
-import { createRequire } from "node:module";
+import { directCredentials } from "./direct-credentials.js";
 import { validateHeaderValue, type IncomingMessage } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import type { CccEnvironment } from "./cli-args.js";
-import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
-import { withRecallReceipt } from "./recall.js";
+import { memtreeStorageIdentity } from "./config.js";
+import { withRecallReceipt, type RecallInvocation } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1141,7 +1141,8 @@ export async function handleMcpMessage(
   notice?: { next(): string | undefined },
   /** Not in a ccc-routed session: no tools, no instructions. */
   inert = false,
-  direct = false
+  direct = false,
+  invocation?: RecallInvocation,
 ): Promise<object | undefined> {
   if (!isRpcRequest(input)) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
@@ -1179,8 +1180,8 @@ export async function handleMcpMessage(
       };
       try {
         const meta = message.params?._meta as Record<string, unknown> | undefined;
-        const text = await withRecallReceipt(String(name), meta?.["claudecode/toolUseId"], () => callTool(String(name), args, tree, finder));
-        return reply({ content: [{ type: "text", text: withNotice(text) }] });
+        const text = await withRecallReceipt(String(name), meta?.["claudecode/toolUseId"], () => callTool(String(name), args, tree, finder).then(withNotice), invocation);
+        return reply({ content: [{ type: "text", text }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
         const message = direct && err instanceof InvalidTreeIdError ? DIRECT_TREE_GUIDANCE
@@ -1419,43 +1420,7 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
   return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
 
-// These switches only suppress warnings, include their call stacks, or turn off
-// the inspector signal. The one valued flag only sets a numeric V8 heap limit.
-const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation"];
-if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1")) DIRECT_NODE_SWITCHES.push("--disable-sigusr1");
 const DIRECT_USAGE = "Usage: ccc memtree-mcp --direct [--env staging|production]";
-
-function nodeOptionsArgs(options: string): string[] {
-  // Node splits on spaces outside double quotes. A backslash escapes the next
-  // character only inside quotes. Leave all other characters literal.
-  const args: string[] = [];
-  let quoted = false;
-  let arg = "";
-  for (let i = 0; i < options.length; i++) {
-    const c = options[i];
-    if (c === '"') quoted = !quoted;
-    else if (quoted && c === "\\") arg += options[++i] ?? "";
-    else if (!quoted && c === " ") {
-      if (arg) args.push(arg);
-      arg = "";
-    } else arg += c;
-  }
-  // Node normally rejects unterminated quotes before it reaches the entry point.
-  if (quoted) throw new Error("Invalid quoting in NODE_OPTIONS.");
-  if (arg) args.push(arg);
-  return args;
-}
-
-function checkDirectNodeFlags(args: string[], source: "NODE_OPTIONS" | "Node command line"): void {
-  for (const arg of args) {
-    if (DIRECT_NODE_SWITCHES.includes(arg) || /^--(?:max-old-space-size|max_old_space_size)=[0-9]+$/.test(arg)) continue;
-    const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
-    const fix = source === "NODE_OPTIONS"
-      ? "Remove the flag from NODE_OPTIONS or clear NODE_OPTIONS in this MCP server's environment."
-      : "Remove the flag from the Node command line.";
-    throw new Error(`Unsupported Node flag ${name} in ${source}. ${fix} MemTree direct mode accepts only --max-old-space-size=N (or --max_old_space_size=N), ${DIRECT_NODE_SWITCHES.join(", ")}.`);
-  }
-}
 
 function directEnvironment(args: string[], defaultEnv: CccEnvironment): "staging" | "production" | undefined {
   try {
@@ -1479,44 +1444,19 @@ export function runMemtreeMcpServer(
   const inert = desktop && !target;
   let deps: MemtreeMcpDeps;
   if (direct) {
-    if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
-      throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
-    }
-    // Diagnostics can log raw traffic or capture the saved key from memory.
-    if (env.NODE_DEBUG !== undefined) {
-      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
-    }
-    try {
-      checkDirectNodeFlags(process.execArgv, "Node command line");
-      checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""), "NODE_OPTIONS");
-    } catch (err) {
-      console.error(err instanceof Error ? err.message : "Invalid Node startup flags.");
-      process.exitCode = 1;
-      return;
-    }
     const mode = directEnvironment(args, defaultEnv);
     if (!mode) {
       console.error(DIRECT_USAGE);
       process.exitCode = 1;
       return;
     }
-    // Node 20 lacks --disable-sigusr1. Claim the signal before loading the key.
-    if (process.platform !== "win32") process.on("SIGUSR1", () => {});
-    // The inspector might already be listening. Some Node builds omit it entirely.
-    if (process.features.inspector) {
-      const inspector: typeof import("node:inspector") = createRequire(import.meta.url)("node:inspector");
-      if (inspector.url()) {
-        console.error("The Node inspector is already listening. Restart the MemTree MCP server with debugging disabled.");
-        process.exitCode = 1;
-        return;
-      }
+    try {
+      deps = { direct: directCredentials(mode, env) };
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : "MemTree credentials unavailable.");
+      process.exitCode = 1;
+      return;
     }
-    const savedKey = storedApiKey(mode, { warnOnLegacy: false });
-    const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
-    if (!apiKey) {
-      throw new Error(`No MemTree key saved for ${mode}. Run ccc${mode === "staging" ? " staging" : ""} to save one.`);
-    }
-    deps = { direct: { baseUrl: memtreeBaseUrlFor(mode), apiKey } };
   } else {
     deps = {
       proxyUrl: desktop ? target?.proxyUrl : env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
@@ -1525,6 +1465,8 @@ export function runMemtreeMcpServer(
       ...(target?.token ? { token: target.token } : {}),
     };
   }
+  const account = deps.direct ? memtreeStorageIdentity(deps.direct.baseUrl, deps.direct.apiKey)
+    : deps.proxyUrl && deps.proxyUrl === env.CCC_RECALL_PROXY_URL ? env.CCC_RECALL_ACCOUNT : undefined;
   const tree = new CurrentTree(deps);
   const finder = new SessionFinder(deps);
   const versionNote = direct ? undefined : versionMismatchNote(env[PROXY_VERSION_ENV]);
@@ -1560,13 +1502,23 @@ export function runMemtreeMcpServer(
           await refreshHostSession(deps);
           if (desktop) refreshSessionFromClaudePidFile(deps, env);
         }
-        const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct)
+        // Direct tools still have no implicit current tree. This id belongs only to the hook handoff.
+        const caller = { sessionId: deps.sessionId || env.CLAUDE_CODE_SESSION_ID };
+        if (direct && account && env.CCC_RECALL_HOOKS_ACTIVE === "1" && isToolCall(message)) {
+          refreshSessionFromClaudePidFile(caller, env);
+        }
+        let publish: (() => Promise<void>) | undefined;
+        const invocation: RecallInvocation | undefined = account && caller.sessionId ? {
+          account, session: caller.sessionId, afterReply: write => { publish = write; },
+        } : undefined;
+        const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct, invocation)
           .catch((err) => ({
           jsonrpc: "2.0",
           id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },
         }));
         if (response) send(response);
+        await publish?.();
       });
     }
   });

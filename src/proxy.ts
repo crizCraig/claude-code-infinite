@@ -181,7 +181,7 @@ import type { ResumeGuidance } from "./resume-guidance.js";
 import {
   PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX,
 } from "./hooks.js";
-import { recalled, recallLine, type RecallContext, type RecallBatch } from "./recall.js";
+import { beginRecall, recalled, recallLine, type RecallContext, type RecallBatch } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -545,15 +545,25 @@ interface MemtreePage {
   seq: number;
 }
 
+interface SessionRecalls {
+  prompt?: string;
+  contexts: Map<string | undefined, RecallContext>;
+  agents: Set<string>;
+  pending: { agent?: string; batch: Promise<RecallBatch | undefined> }[];
+}
+
+function sessionRecalls(sessions: Map<string, SessionRecalls>, id: string): SessionRecalls {
+  let state = sessions.get(id);
+  if (!state) {
+    state = { contexts: new Map(), agents: new Set(), pending: [] };
+    sessions.set(id, state);
+  }
+  return state;
+}
+
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
-  recall?: {
-    session?: string;
-    prompt?: string;
-    contexts: Map<string | undefined, RecallContext>;
-    agents: Set<string>;
-    batches: RecallBatch[];
-  };
+  recall?: Map<string, SessionRecalls>;
   /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
   threadRefusals: ThreadRefusals;
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
@@ -1191,7 +1201,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const backgroundAbort = new AbortController();
   const state: ProxyState = {
-    recall: opts.visibleRecall ? { contexts: new Map(), agents: new Set(), batches: [] } : undefined,
+    recall: opts.visibleRecall ? new Map() : undefined,
     threadRefusals: new ThreadRefusals(),
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
@@ -1433,10 +1443,15 @@ async function handleRequest(
     if (raw && recall) {
       try {
         const input = JSON.parse(raw.toString("utf8"));
-        if (recall.prompt && input.session_id === recall.session &&
-            (input.prompt_id === recall.prompt || recall.agents.has(input.agent_id))) {
-          const batch = recalled(input, recall.contexts.get(input.agent_id));
-          if (batch) recall.batches.push(batch);
+        if (input.hook_event_name === "PreToolUse") {
+          await beginRecall(input, opts.memtree.storageIdentity);
+          res.writeHead(204).end();
+          return;
+        }
+        const session = recall.get(input.session_id);
+        if (session && (input.agent_id ? session.agents.has(input.agent_id) : input.prompt_id === session.prompt)) {
+          const batch = recalled(input, session.contexts.get(input.agent_id), opts.memtree.storageIdentity);
+          session.pending.push({ agent: input.agent_id, batch: batch.catch(() => undefined) });
         }
       } catch { /* Optional UI; never return hook feedback to the model. */ }
     }
@@ -2127,12 +2142,13 @@ async function handleNoticeHook(
       return;
     }
     if (parsed.agent_id === undefined) {
-      if (state.recall) {
-        state.recall.session = parsed.session_id;
-        state.recall.prompt = parsed.prompt_id;
-        state.recall.contexts.clear();
-        state.recall.agents.clear();
-        state.recall.batches = [];
+      if (state.recall && parsed.prompt_id) {
+        const session = sessionRecalls(state.recall, parsed.session_id);
+        if (session.prompt !== parsed.prompt_id) {
+          session.prompt = parsed.prompt_id;
+          session.contexts.delete(undefined);
+          session.pending = session.pending.filter(call => call.agent);
+        }
       }
       state.promptAccounting.add(parsed.session_id, parsed.prompt_id, parsed.prompt);
       recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
@@ -2156,7 +2172,7 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStart") {
-    if (state.recall?.prompt && state.recall.session === parsed.session_id) state.recall.agents.add(parsed.agent_id);
+    if (state.recall) sessionRecalls(state.recall, parsed.session_id).agents.add(parsed.agent_id);
     state.activeSubagents.add(parsed.agent_id);
     const hint = await subagentHintContext(state, parsed.session_id);
     if (hint === undefined) {
@@ -2174,8 +2190,12 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStop") {
-    state.recall?.agents.delete(parsed.agent_id);
-    state.recall?.contexts.delete(parsed.agent_id);
+    const session = state.recall?.get(parsed.session_id);
+    if (session) {
+      session.agents.delete(parsed.agent_id);
+      session.contexts.delete(parsed.agent_id);
+      if (!session.prompt && !session.agents.size && !session.pending.length) state.recall?.delete(parsed.session_id);
+    }
     state.activeSubagents.delete(parsed.agent_id);
     sendDeferredAgentIndex(state, parsed.agent_id);
     res.writeHead(204);
@@ -2195,18 +2215,6 @@ async function handleNoticeHook(
       ? null
       : state.notices.claim(parsed);
   if (stopMatchesMainPrompt) {
-    const recall = state.recall;
-    if (recall && parsed.session_id === recall.session && parsed.prompt_id === recall.prompt) {
-      const line = recallLine(recall.batches);
-      if (line) {
-        const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
-        output = { systemMessage: joinNoticeLines(line, existing)! };
-      }
-      recall.contexts.clear();
-      recall.agents.clear();
-      recall.batches = [];
-      recall.prompt = undefined;
-    }
     onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
     state.mainNoticePending = false;
     state.mainPromptId = undefined;
@@ -2215,6 +2223,23 @@ async function handleNoticeHook(
     // delivery callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
     // Subagent lifetimes are independent; only their own stop events retire them.
+  }
+  if (parsed.hook_event_name === "Stop" && !parsed.agent_id && parsed.prompt_id) {
+    const session = state.recall?.get(parsed.session_id);
+    if (session && (!session.prompt || session.prompt === parsed.prompt_id)) {
+      // Detach synchronously. An agent completing during this await belongs to the next Stop.
+      const pending = session.pending;
+      session.pending = [];
+      session.prompt = undefined;
+      session.contexts.delete(undefined);
+      if (!session.agents.size) state.recall?.delete(parsed.session_id);
+      const batches = (await Promise.all(pending.map(call => call.batch))).filter((b): b is RecallBatch => !!b);
+      const line = recallLine(batches);
+      if (line) {
+        const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
+        output = { systemMessage: joinNoticeLines(line, existing)! };
+      }
+    }
   }
   if (!output) {
     res.writeHead(204);
@@ -7647,13 +7672,12 @@ async function selectForwardCandidate(args: {
   const whole = candidate.kind === "original" || wholeHistoryCandidates.has(candidate);
   // Only the conversation actually selected for this prompt can establish
   // a current-session recall. An index or a prepared compression proves nothing.
-  const recall = args.state.recall;
-  if (recall?.prompt && !args.rec.notConversation && args.rec.routeLane !== "away" &&
-      recall.session === requestSessionId(args.req)) {
+  const session = requestSessionId(args.req);
+  const recall = session ? args.state.recall?.get(session) : undefined;
+  if (session && recall && !args.rec.notConversation && args.rec.routeLane !== "away") {
     const agent = agentAttributionId(args.req);
     if (whole) recall.contexts.delete(agent);
-    else if (!agent || recall.agents.has(agent)) {
-      const session = recall.session!;
+    else if (agent ? recall.agents.has(agent) : recall.prompt) {
       const timesFor = transcriptTimesFor(args.opts, session, agent);
       const messages = args.body.messages as Message[];
       let times: MessageTimes | undefined;
