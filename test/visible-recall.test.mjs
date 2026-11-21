@@ -1,5 +1,5 @@
 // Use a disposable ccc home for both sides of the MCP/hook handoff.
-import test, { after } from "node:test";
+import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,6 +13,9 @@ process.env.CLAUDE_CONFIG_DIR = path.join(home, ".claude");
 delete process.env.CCC_RECALL_WRAPPED;
 after(() => fs.rmSync(home, { recursive: true, force: true }));
 
+// Each scenario may reuse the same simulated Claude prompt and session IDs.
+beforeEach(() => fs.rmSync(path.join(home, ".claude-code-infinite"), { recursive: true, force: true }));
+
 const { beginRecall, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
 const { handleMcpMessage } = await import("../dist/memtree-mcp.js");
 const { MemtreeIndex, formatTail } = await import("../dist/memtree-tools.js");
@@ -24,15 +27,12 @@ const { MemtreeClient } = await import("../dist/memtree.js");
 const example = JSON.parse(fs.readFileSync(new URL("./fixtures/memtree-page.json", import.meta.url)));
 const current = "here";
 const account = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }).storageIdentity;
-const recalled = (input, context, scope = account) => consume(input, context, scope);
+const recalled = (input, scope = account) => consume(input, scope);
 const standaloneRecall = input => directHook(input, account);
 const focus = new MemtreeIndex({ ...example, session_id: current });
 const other = new MemtreeIndex({ ...example, session_id: "there" });
 const source = { get: async tree => tree === "past" ? other : focus,
   tail: async () => formatTail({ session_id: "there", messages: [] }) };
-const original = Buffer.from(JSON.stringify(focus.page.blocks));
-const sent = Buffer.from("Only the recent turn remains. The billing service port is 8443");
-const context = { original, sent };
 
 async function tool(name, args, finder, { id = randomUUID(), session = current, scope = account, tree = source, prompt = "turn", agent } = {}) {
   const call = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } };
@@ -47,23 +47,11 @@ async function tool(name, args, finder, { id = randomUUID(), session = current, 
 const read = (tree, start, end = start, caller) => tool("read_lines", { tree, block: 0, start, end }, undefined, caller);
 const stop = { hook_event_name: "Stop", session_id: current, prompt_id: "turn" };
 
-test("reads compare the actual returned range with the compressed context", async () => {
-  assert.equal(await recalled(await read("current", 5), context), undefined, "this line is still visible");
-  assert.equal(await recalled(await read("current", 4)), undefined, "an index alone is insufficient");
-  assert.equal(await recalled(await read("current", 4), { original, sent: original }), undefined);
-  const batch = await recalled(await read("current", 4), context);
-  assert.equal(batch.past, 0);
-  assert.match(recallLine([batch]), /^🌿 MemTree recalled from earlier in this session: User asks/);
-  assert.doesNotMatch(recallLine([batch]), /billing-artifacts|deploy.yaml with region/);
-  const leaf = await recalled(await tool("read_node", { node: "current#3" }), { original: Buffer.from("Bucket renamed."), sent });
-  assert.equal(leaf.label, "Bucket renamed.");
-  assert.equal((await recalled(await tool("search", { query: "7731", tree: "current", mode: "text" }), context)).count, 1);
-});
-
-test("read_node stays silent when its answer survived compression and only descendant lines disappeared", async () => {
-  const input = await tool("read_node", { node: "current#3" });
-  const answer = Buffer.from(JSON.stringify(input.tool_response));
-  assert.equal(await recalled(input, { original: Buffer.concat([original, answer]), sent: answer }), undefined);
+test("search, read_node and read_lines stay silent for the calling session", async () => {
+  for (const input of [
+    await read("current", 4), await tool("read_node", { node: "current#3" }),
+    await tool("search", { query: "7731", tree: "current", mode: "text" }),
+  ]) assert.equal(await recalled(input), undefined);
 });
 
 test("spilled MCP text must match the saved answer in the calling session", async () => {
@@ -74,16 +62,16 @@ test("spilled MCP text must match the saved answer in the calling session", asyn
   const file = path.join(dir, "mcp-memtree-read_lines-fixture.txt");
   const pointer = [{ type: "text", text: "Error: result (100,021 characters) exceeds maximum allowed tokens. Output has been saved to " + file + ".\nFormat: Plain text" }];
   fs.writeFileSync(file, input.tool_response[0].text);
-  assert.equal((await recalled({ ...input, tool_response: pointer })).past, 1);
+  assert.equal((await recalled({ ...input, tool_response: pointer })).count, 1);
   fs.writeFileSync(file, "other answer");
   assert.equal(await recalled({ ...await read("past", 4), tool_response: pointer }), undefined);
 });
 
 test("a replayed tool ID cannot cross account or calling session", async () => {
   const input = await read("past", 4);
-  assert.equal(await recalled(input, undefined, "another-account"), undefined);
+  assert.equal(await recalled(input, "another-account"), undefined);
   assert.equal(await recalled({ ...input, session_id: "another-session" }), undefined);
-  assert.equal((await recalled(input)).past, 1);
+  assert.equal((await recalled(input)).count, 1);
 });
 
 test("a new invocation cannot reuse an interrupted receipt even for byte-identical results", async () => {
@@ -129,15 +117,6 @@ test("a dated hit supplies the session date for an undated first hit from the sa
   assert.match(recallLine([batch], new Date(2026, 10, 20)), /from a session on Nov 3: Original label/);
 });
 
-test("large current-session checks yield before scanning the entire request", async () => {
-  const input = await read("current", 4);
-  let yielded = false;
-  setImmediate(() => { yielded = true; });
-  const batch = await recalled(input, { original: Buffer.concat([Buffer.alloc(8 << 20), original]), sent: Buffer.alloc(4 << 20) });
-  assert.equal(batch?.count, 1);
-  assert.equal(yielded, true);
-});
-
 test("grouped and mixed search results use only qualifying source summaries", async () => {
   const at = new Date(2026, 10, 17, 23, 58).toISOString();
   const hit = (session_id, summary, snippet) => ({ id: session_id, session_id, tree: { request_id: "ref" },
@@ -148,28 +127,13 @@ test("grouped and mixed search results use only qualifying source summaries", as
     hit("past-b", "", "PRIVATE TRANSCRIPT"),
   ] }] }, { query: "q" }) };
   const input = await tool("search", { query: "q" }, finder);
-  const batch = await recalled(input, context);
+  const batch = await recalled(input);
   assert.equal(batch.count, 2);
-  assert.equal(batch.past, 2);
   assert.equal(Array.from(batch.label).length, 60);
   const line = recallLine([batch], new Date(2026, 10, 20, 8));
   assert.match(line, /^🌿 MemTree recalled from Tuesday’s session: Deployment decision x+… …and 1 more$/);
   assert.doesNotMatch(line, /PRIVATE|Already visible|[\x00-\x1f]/);
-  assert.equal(await recalled(input, context), undefined, "a retried PostToolUse cannot claim it twice");
-});
-
-test("a summary-only hit can identify omitted source by its recorded message time", async () => {
-  const at = "2026-01-01T12:30:00Z";
-  const finder = { searchSessions: async () => formatSearchResults({ hits: [{
-    tree: { request_id: "r" }, session_id: current, summary: "A deployment decision", times: [at, at],
-  }] }, { query: "deploy" }) };
-  const input = await tool("search", { query: "deploy" }, finder);
-  const batch = await recalled(input, { ...context, sourceAt: time => {
-    assert.equal(time, at);
-    return ["bucket billing-artifacts-7731"];
-  } });
-  assert.equal(batch.label, "A deployment decision");
-  assert.equal(batch.past, 0);
+  assert.equal(await recalled(input), undefined, "a retried PostToolUse cannot claim it twice");
 });
 
 test("empty searches, unavailable nodes, empty tails, unrelated tools and opt-out stay silent", async () => {
@@ -193,12 +157,12 @@ test("direct Claude settings preserve paths as separate Windows arguments; separ
     assert.deepEqual(hook.args, [cli, "recall-hook"]);
     assert.equal(hook.async, undefined);
   }
-  const before = pastRecallCount(current);
+  const before = pastRecallCount(current, account);
   for (const input of await Promise.all([read("past", 4), tool("read_node", { node: "past#3" })])) {
     assert.equal(await standaloneRecall(input), undefined);
   }
-  assert.equal(pastRecallCount(current), before + 2);
-  assert.equal(pastRecallCount("other-session"), 0);
+  assert.equal(pastRecallCount(current, account), before + 2);
+  assert.equal(pastRecallCount("other-session", account), 0);
   const line = await standaloneRecall(stop);
   assert.match(line, /^🌿 MemTree recalled from a past session: .* …and 1 more$/);
   assert.doesNotMatch(line, /billing-artifacts/);
@@ -225,25 +189,29 @@ test("ccc's interactive HTTP hooks merge recalls at Stop and discard interrupted
     const output = await post(stop);
     assert.deepEqual(Object.keys(output), ["systemMessage"]);
     assert.match(output.systemMessage, / …and 1 more$/);
+    await post({ ...stop, agent_id: "continued", hook_event_name: "SubagentStart" });
+    await post(await read("past", 4, 4, { agent: "continued" }), recallHook.hooks[0].url);
     assert.equal(await post(stop), null);
     await prompt("turn-2");
-    const input = await read("past", 4, 4, { prompt: "turn-2" });
+    assert.match((await post({ ...stop, prompt_id: "turn-2" })).systemMessage, /MemTree recalled/);
+    await prompt("turn-3");
+    const input = await read("past", 4, 4, { prompt: "turn-3" });
     await post(input, recallHook.hooks[0].url);
-    assert.match((await post({ ...stop, prompt_id: "turn-2" })).systemMessage, /🌿 MemTree recalled/);
+    assert.match((await post({ ...stop, prompt_id: "turn-3" })).systemMessage, /🌿 MemTree recalled/);
   } finally {
     plugin.close();
     await proxy.drain();
   }
 });
 
-test("wrapped PostToolUse returns before receipt publication and Stop joins the pending result", async () => {
+test("wrapped hooks skip missing receipts even if they arrive later", async () => {
   const proxy = await startProxy({ visibleRecall: true,
     memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) });
   const hook = { ...stop, tool_use_id: randomUUID(), tool_name: "mcp__memtree__read_node" };
   const post = (url, input) => fetch(url, { method: "POST", body: JSON.stringify(input) });
   try {
     await post(proxy.hookUrl, { ...stop, hook_event_name: "UserPromptSubmit", prompt: "hello" });
-    await post(proxy.hookUrl + "/recall", { ...hook, hook_event_name: "PreToolUse" });
+    await beginRecall({ ...hook, hook_event_name: "PreToolUse" }, account);
     let publish;
     const reply = await handleMcpMessage({ id: 1, method: "tools/call", params: {
       name: "read_node", arguments: { node: "past#3" }, _meta: { "claudecode/toolUseId": hook.tool_use_id },
@@ -253,13 +221,14 @@ test("wrapped PostToolUse returns before receipt publication and Stop joins the 
     assert.equal((await post(proxy.hookUrl + "/recall", {
       ...hook, hook_event_name: "PostToolUse", tool_response: reply.result.content,
     })).status, 204);
-    await publish();
     const response = await post(proxy.hookUrl, stop);
-    assert.match((await response.json()).systemMessage, /Bucket renamed/);
+    assert.equal(response.status, 204);
+    await publish();
+    assert.equal((await post(proxy.hookUrl, stop)).status, 204);
   } finally { await proxy.drain(); }
 });
 
-test("current-session attribution follows the selected proxy request", async () => {
+test("wrapped reads of compressed-away current-session content stay silent", async () => {
   const secret = "I created deploy.yaml with region us-west2 and bucket billing-artifacts-7731";
   const calls = [];
   const kept = "compressed history of the billing project. ".repeat(6);
@@ -292,7 +261,8 @@ test("current-session attribution follows the selected proxy request", async () 
     assert.equal(calls.some(c => c.includes(kept) && !c.includes(secret)), true, "fixture compressed the history");
     await send(proxy.hookUrl + "/recall", await tool("read_lines", { tree: "current", block: 0, start: 4, end: 4 }, undefined, { scope: memtree.storageIdentity }));
     const response = await send(proxy.hookUrl, stop);
-    assert.match((await response.json()).systemMessage, /🌿 MemTree recalled from earlier in this session/);
+    const output = response.status === 204 ? {} : await response.json();
+    assert.doesNotMatch(output.systemMessage ?? "", /MemTree recalled/);
     assert.ok(calls.every(c => !c.includes("MemTree recalled")));
   } finally {
     await proxy.drain();
@@ -302,8 +272,10 @@ test("current-session attribution follows the selected proxy request", async () 
 
 test("direct background recalls arriving after the parent Stop appear once on its next Stop", async () => {
   const event = { ...stop, prompt_id: "background-parent" };
-  await standaloneRecall(event);
+  await standaloneRecall(await read("past", 4, 4, { prompt: event.prompt_id }));
+  assert.match(await standaloneRecall(event), /MemTree recalled/);
   await standaloneRecall(await read("past", 4, 4, { prompt: "agent-prompt", agent: "bg" }));
+  assert.equal(await standaloneRecall(event), undefined);
   const next = { ...stop, prompt_id: "next-parent" };
   assert.match(await standaloneRecall(next), /🌿 MemTree recalled/);
   assert.equal(await standaloneRecall(next), undefined);
@@ -338,3 +310,62 @@ for (const scenario of ["teammate prompt", "late background agent", "late backgr
     } finally { await proxy.drain(); }
   });
 }
+
+test("direct PostToolUse tries a missing receipt once", async t => {
+  const input = await read("past", 4);
+  await standaloneRecall({ ...input, hook_event_name: "PreToolUse" });
+  const renames = t.mock.method(fs.promises, "rename");
+  assert.equal(await standaloneRecall(input), undefined);
+  assert.equal(renames.mock.callCount(), 1);
+});
+
+test("repeated Stops racing after another recall cannot announce the same prompt again", async () => {
+  const prompt = "continued-prompt";
+  const event = { ...stop, prompt_id: prompt };
+  const recall = () => read("past", 4, 4, { prompt }).then(standaloneRecall);
+  assert.equal(await standaloneRecall(event), undefined);
+  await recall();
+  const first = await Promise.all([standaloneRecall(event), standaloneRecall(event)]);
+  assert.equal(first.filter(Boolean).length, 1);
+  assert.match(first.find(Boolean), /MemTree recalled/);
+  await Promise.all([recall(), recall()]);
+  assert.deepEqual(await Promise.all([standaloneRecall(event), standaloneRecall(event)]), [undefined, undefined]);
+});
+
+test("exit counts are isolated when accounts resume the same Claude session", async () => {
+  const session = "shared-session";
+  for (const scope of [account, "another-account", account]) {
+    await directHook(await read("past", 4, 4, { session, scope }), scope);
+  }
+  assert.equal(pastRecallCount(session, account), 2);
+  assert.equal(pastRecallCount(session, "another-account"), 1);
+});
+
+test("wrapped PreToolUse releases Claude while ticket publication is blocked", async t => {
+  const proxy = await startProxy({ visibleRecall: true,
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) });
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const hook = await read("past", 4);
+  const post = (input, suffix = "", signal) =>
+    fetch(proxy.hookUrl + suffix, { method: "POST", body: JSON.stringify(input), signal });
+  try {
+    await post({ ...stop, hook_event_name: "UserPromptSubmit", prompt: "question" });
+    const rename = fs.promises.rename;
+    const mock = t.mock.method(fs.promises, "rename", async (...args) => {
+      entered();
+      await gate;
+      return rename(...args);
+    });
+    const pre = await post({ ...hook, hook_event_name: "PreToolUse" }, "/recall", AbortSignal.timeout(5000));
+    assert.equal(pre.status, 204);
+    await started;
+    mock.mock.restore();
+    await post(hook, "/recall"); // Identical answer with the old ticket still on disk.
+    assert.equal((await post(stop)).status, 204);
+  } finally {
+    release();
+    await proxy.drain();
+  }
+});

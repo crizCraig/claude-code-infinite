@@ -66,7 +66,7 @@ import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
-import { type RecallContext, type RecallBatch } from "./recall.js";
+import { type RecallBatch } from "./recall.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { UrlOpener } from "./open-url.js";
 import { ThreadRefusals, type MessageThreadsMode } from "./thread-backstop.js";
@@ -364,7 +364,6 @@ interface MemtreePage {
 }
 interface SessionRecalls {
     prompt?: string;
-    contexts: Map<string | undefined, RecallContext>;
     agents: Set<string>;
     pending: {
         agent?: string;

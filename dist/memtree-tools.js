@@ -103,30 +103,6 @@ export class MemtreeIndex {
     sessionTime() {
         return this.times.get(0)?.[0] ?? this.page.tree_created_at ?? this.page.created_at;
     }
-    /** Representative lines for search hits with a summary and no snippets. */
-    *recallLines(id) {
-        const seen = new Set();
-        const stack = [id];
-        while (stack.length) {
-            const next = stack.pop();
-            const node = this.nodes.get(next);
-            if (!node || seen.has(next))
-                continue;
-            seen.add(next);
-            if (this.isLeaf(node)) {
-                const [block, start, end] = node.l;
-                const lines = this.lines[block] ?? [];
-                for (let i = Math.max(1, start); i <= Math.min(end, lines.length); i++) {
-                    if (lines[i - 1].trim() && !MESSAGE_HEADER_RE.test(lines[i - 1]))
-                        yield lines[i - 1];
-                }
-            }
-            else {
-                for (const child of node.k ?? [])
-                    stack.push(child);
-            }
-        }
-    }
     /** Root first, the node's parent last. */
     ancestors(id) {
         const path = [];
@@ -345,11 +321,12 @@ treeTimes, session, index) {
     collectRecalls(() => {
         for (const hit of hits) {
             const at = hit.times?.[0] ?? hit.snippets.find(s => s.at)?.at ?? treeTimes?.[0] ?? index?.sessionTime();
-            recallPassage(session, hit.summary, at, hit.snippets.length ? hit.snippets.map(s => s.text) : index?.recallLines(hit.id) ?? [], hit.times?.[0]);
+            if (hit.summary || hit.snippets.length)
+                recallPassage(session, hit.summary, at);
         }
         for (const hit of tailHits) {
             if (hit.snippets.length)
-                recallPassage(session, "", hit.at ?? treeTimes?.[0] ?? index?.sessionTime(), hit.snippets.map(s => s.text));
+                recallPassage(session, "", hit.at ?? treeTimes?.[0] ?? index?.sessionTime());
         }
     });
     if (!hits.length && tailHits.length) {
@@ -438,11 +415,8 @@ export function formatNode(index, id, tree) {
         }
     }
     collectRecalls(() => {
-        // Only summary text this answer actually returns can establish a current-session recall.
-        const related = [...path, ...children].map(n => truncate(index.nodes.get(n)?.s ?? "", SUMMARY_CHARS));
-        const summaries = [node.s ?? "", ...related];
-        if (summaries.some(s => s.trim())) {
-            recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.sessionTime(), summaries);
+        if (node.s?.trim() || [...path, ...children].some(n => index.nodes.get(n)?.s?.trim())) {
+            recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.sessionTime());
         }
     });
     return out.join("\n");
@@ -513,11 +487,10 @@ export function formatLines(index, block, start, end, tree) {
         shown = n;
     }
     collectRecalls(() => {
-        const excerpts = rows.map(([, text]) => text).filter(text => text.trim() && !MESSAGE_HEADER_RE.test(text));
-        if (!excerpts.length)
+        if (!rows.some(([, text]) => text.trim() && !MESSAGE_HEADER_RE.test(text)))
             return;
         const leaf = Array.from(index.nodes.values()).find(n => n.l?.[0] === block && n.l[1] <= start && n.l[2] >= start);
-        recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title, index.rangeSpan(block, start, shown)?.[0] ?? index.sessionTime(), excerpts);
+        recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title, index.rangeSpan(block, start, shown)?.[0] ?? index.sessionTime());
     });
     const wanted = Math.min(end, lines.length);
     if (shown < wanted) {
@@ -607,7 +580,7 @@ export function formatTail(body, tree) {
         const useful = messages.filter(m => typeof m.x === "string" && m.x.trim());
         if (useful.length) {
             const at = useful.find(m => m.at)?.at ?? messages.find(m => m.at)?.at ?? page.tree_created_at ?? page.created_at;
-            recallPassage(page.session_id, page.title, at, useful.map(m => m.x));
+            recallPassage(page.session_id, page.title, at);
         }
     });
     const first = messages[0].i;

@@ -116,12 +116,11 @@ In interactive Claude Code, a successful recall gets one line at the end of the 
 🌿 MemTree recalled from Tuesday’s session: Billing service deployment …and 2 more
 ```
 
-The line names the first qualifying passage and counts the others. A read of the
-current session qualifies when ccc can verify that source text disappeared from
-the request sent to Claude during compression. Past-session dates use your local
-calendar. An undated past session is labeled “a past session.” If a background
-agent recalls something after its parent stops, the next Stop in that session
-shows the notice. The exit summary counts past-session passages across resumes.
+Only passages from a different Claude session qualify. Each prompt can show one
+line, which names the first qualifying passage and counts the others. Dates use
+your local calendar. An undated past session is labeled “a past session.” A late
+background recall can appear at the next parent Stop. The exit summary counts
+past-session passages across resumes for the same MemTree account and Claude session.
 Set `CCC_RECALL_NOTICE=0` to turn off recall notices and counting.
 
 ### Read ccc sessions from Codex or another MCP client

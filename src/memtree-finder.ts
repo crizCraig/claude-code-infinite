@@ -383,13 +383,10 @@ const OPEN_NOTE =
 
 function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[] {
   collectRecalls(() => {
-    const lines = Array.isArray(hit.snippets) ? hit.snippets.filter(s => typeof s?.text === "string").map(s => s.text) : [];
-    const excerpts = lines.length ? lines : typeof hit.snippet === "string" ? [hit.snippet] : [];
     const summary = hit.summary || hit.path?.at(-1)?.summary;
-    const sourceTime = timeSpan(hit.times)?.[0];
-    if (summary || excerpts.some(s => s?.trim())) {
+    if (summary || hit.snippets?.some(s => s?.text?.trim()) || hit.snippet?.trim()) {
       recallPassage(hit.session_id || (hit.kind === "claude_code_session" ? hit.id : undefined),
-        summary, sourceTime ?? hit.tree?.created_at, excerpts.map(s => s.replace(/<\/?b>|\*\*/gi, "")), sourceTime);
+        summary, timeSpan(hit.times)?.[0] ?? hit.tree?.created_at);
     }
   });
   const tree = hit.tree?.request_id;

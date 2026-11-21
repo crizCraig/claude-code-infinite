@@ -62,8 +62,6 @@ export declare class MemtreeIndex {
     get blockCount(): number;
     blockLines(block: number): string[] | undefined;
     sessionTime(): unknown;
-    /** Representative lines for search hits with a summary and no snippets. */
-    recallLines(id: number): Iterable<string>;
     /** Root first, the node's parent last. */
     ancestors(id: number): number[];
     isLeaf(node: MemtreeNode): boolean;

@@ -75,7 +75,7 @@ import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKi
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX, } from "./hooks.js";
-import { beginRecall, recalled, recallLine } from "./recall.js";
+import { beginRecall, recalled, claimRecallPrompt, recallLine } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -127,7 +127,7 @@ const SKIP_RESPONSE_HEADERS = new Set([
 function sessionRecalls(sessions, id) {
     let state = sessions.get(id);
     if (!state) {
-        state = { contexts: new Map(), agents: new Set(), pending: [] };
+        state = { agents: new Set(), pending: [] };
         sessions.set(id, state);
     }
     return state;
@@ -594,13 +594,17 @@ async function handleRequest(req, res, opts, upstream, state, hookPath, intercep
             try {
                 const input = JSON.parse(raw.toString("utf8"));
                 if (input.hook_event_name === "PreToolUse") {
-                    await beginRecall(input, opts.memtree.storageIdentity);
+                    // A Stop hook can ask Claude to continue the same prompt without another submit.
+                    if (!input.agent_id && input.session_id && input.prompt_id) {
+                        sessionRecalls(recall, input.session_id).prompt ??= input.prompt_id;
+                    }
+                    void beginRecall(input, opts.memtree.storageIdentity).catch(() => { });
                     res.writeHead(204).end();
                     return;
                 }
                 const session = recall.get(input.session_id);
                 if (session && (input.agent_id ? session.agents.has(input.agent_id) : input.prompt_id === session.prompt)) {
-                    const batch = recalled(input, session.contexts.get(input.agent_id), opts.memtree.storageIdentity);
+                    const batch = recalled(input, opts.memtree.storageIdentity);
                     session.pending.push({ agent: input.agent_id, batch: batch.catch(() => undefined) });
                 }
             }
@@ -1208,7 +1212,6 @@ onlyEvent) {
                 const session = sessionRecalls(state.recall, parsed.session_id);
                 if (session.prompt !== parsed.prompt_id) {
                     session.prompt = parsed.prompt_id;
-                    session.contexts.delete(undefined);
                     session.pending = session.pending.filter(call => call.agent);
                 }
             }
@@ -1256,7 +1259,6 @@ onlyEvent) {
         const session = state.recall?.get(parsed.session_id);
         if (session) {
             session.agents.delete(parsed.agent_id);
-            session.contexts.delete(parsed.agent_id);
             if (!session.prompt && !session.agents.size && !session.pending.length)
                 state.recall?.delete(parsed.session_id);
         }
@@ -1292,14 +1294,18 @@ onlyEvent) {
             const pending = session.pending;
             session.pending = [];
             session.prompt = undefined;
-            session.contexts.delete(undefined);
             if (!session.agents.size)
                 state.recall?.delete(parsed.session_id);
             const batches = (await Promise.all(pending.map(call => call.batch))).filter((b) => !!b);
             const line = recallLine(batches);
-            if (line) {
+            if (line && await claimRecallPrompt(parsed.session_id, parsed.prompt_id)) {
                 const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
                 output = { systemMessage: joinNoticeLines(line, existing) };
+            }
+            else if (line) {
+                const agents = pending.filter(call => call.agent);
+                if (agents.length)
+                    sessionRecalls(state.recall, parsed.session_id).pending.unshift(...agents);
             }
         }
     }
@@ -5768,31 +5774,6 @@ async function selectForwardCandidate(args) {
     // Uncompressed only when the whole history goes out (or a truncation of
     // it), not a compressed ride.
     const whole = candidate.kind === "original" || wholeHistoryCandidates.has(candidate);
-    // Only the conversation actually selected for this prompt can establish
-    // a current-session recall. An index or a prepared compression proves nothing.
-    const session = requestSessionId(args.req);
-    const recall = session ? args.state.recall?.get(session) : undefined;
-    if (session && recall && !args.rec.notConversation && args.rec.routeLane !== "away") {
-        const agent = agentAttributionId(args.req);
-        if (whole)
-            recall.contexts.delete(agent);
-        else if (agent ? recall.agents.has(agent) : recall.prompt) {
-            const timesFor = transcriptTimesFor(args.opts, session, agent);
-            const messages = args.body.messages;
-            let times;
-            recall.contexts.set(agent, { original: policy.original, sent: candidate.body, sourceAt(at) {
-                    if (!timesFor)
-                        return [];
-                    times ??= timesFor(messages);
-                    const timestamp = Date.parse(at);
-                    const index = Object.keys(times).find(i => Date.parse(times[i]) === timestamp);
-                    const content = index === undefined ? undefined : messages[Number(index)]?.content;
-                    if (typeof content === "string")
-                        return [content];
-                    return Array.isArray(content) ? content.filter(part => part?.type === "text").map(part => part.text) : [];
-                } });
-        }
-    }
     if (degraded && whole) {
         // A failed compress's ride that delivery could not send went out whole.
         if (args.rec.turnType === "followup-prefix") {

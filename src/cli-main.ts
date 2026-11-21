@@ -1139,7 +1139,7 @@ async function main() {
       ? `${creditNoticeText(terminalSupportsColor(), source)}\n`
       : "";
     const limit = interactiveUi ? rateLimits.exitLine() : undefined;
-    const recalls = visibleRecall ? pastRecallCount(proxy.mainSessionId()) : 0;
+    const recalls = visibleRecall ? pastRecallCount(proxy.mainSessionId(), memtree.storageIdentity) : 0;
     const recallSummary = recalls ? `MemTree recalled ${recalls} ${recalls === 1 ? "thing" : "things"} from past sessions\n` : "";
     const exitText = `${recallSummary}${limit ? `${limit}\n` : ""}${credit}${hint ?? ""}`;
     // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
