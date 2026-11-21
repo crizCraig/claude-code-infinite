@@ -31,6 +31,7 @@
  *   with all of them disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
  */
+import { RECALL_ACTIVE, RECALL_MATCHER } from "./recall.js";
 import { HOST_TOKEN_ENV } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -80,6 +81,14 @@ function tomlString(value) {
     return `'${value}'`;
 }
 export function formatDirectMcpConfig(format, command, cli, mode) {
+    if (format === "claude-hooks") {
+        // Claude Code exec-form hooks preserve Windows paths (and shell metacharacters).
+        const hook = { type: "command", command, args: mode === "staging" ? [cli, "recall-hook", mode] : [cli, "recall-hook"], timeout: 5 };
+        return JSON.stringify({ env: { [RECALL_ACTIVE]: "1" }, hooks: {
+                PreToolUse: [{ matcher: RECALL_MATCHER, hooks: [hook] }],
+                PostToolUse: [{ matcher: RECALL_MATCHER, hooks: [hook] }], Stop: [{ hooks: [hook] }],
+            } }, null, 2);
+    }
     const args = [cli, "memtree-mcp", "--direct"];
     if (mode === "staging")
         args.push("--env", mode);
@@ -104,8 +113,8 @@ export function printDirectMcpConfig(args, defaultEnv) {
     }
     const format = values?.format ?? "codex";
     const mode = values?.env ?? defaultEnv;
-    if (!values || (format !== "json" && format !== "codex") || (mode !== "production" && mode !== "staging")) {
-        console.error("Usage: ccc memtree-mcp --print-config [--format codex|json] [--env staging|production]");
+    if (!values || (format !== "json" && format !== "codex" && format !== "claude-hooks") || (mode !== "production" && mode !== "staging")) {
+        console.error("Usage: ccc memtree-mcp --print-config [--format codex|json|claude-hooks] [--env staging|production]");
         return 1;
     }
     const realNode = fs.realpathSync(process.execPath);
@@ -113,7 +122,7 @@ export function printDirectMcpConfig(args, defaultEnv) {
     const cli = fs.realpathSync(new URL("./cli.js", import.meta.url));
     if (command === realNode) {
         const note = "# Using the resolved Node binary. Rerun ccc memtree-mcp --print-config if an upgrade moves it.";
-        (format === "json" ? process.stderr : process.stdout).write(note + "\n");
+        (format === "codex" ? process.stdout : process.stderr).write(note + "\n");
     }
     process.stdout.write(formatDirectMcpConfig(format, command, cli, mode) + "\n");
     return 0;

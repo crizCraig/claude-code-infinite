@@ -66,11 +66,13 @@ import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
+import { WrappedRecallHistory, type RecallBatch } from "./recall.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { UrlOpener } from "./open-url.js";
 import { ThreadRefusals, type MessageThreadsMode } from "./thread-backstop.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
+    visibleRecall?: boolean;
     memtree: MemtreeClient;
     /**
      * Treat current native-1M Anthropic model ids as 1M without requiring the
@@ -360,8 +362,19 @@ interface MemtreePage {
     compressed: boolean;
     seq: number;
 }
+interface SessionRecalls {
+    prompt?: string;
+    agents: Set<string>;
+    pending: {
+        agent?: string;
+        batch?: RecallBatch;
+        verifying: boolean;
+    }[];
+}
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
+    recall?: Map<string, SessionRecalls>;
+    recallHistory: WrappedRecallHistory;
     /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
     threadRefusals: ThreadRefusals;
     /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */

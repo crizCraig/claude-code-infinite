@@ -37,13 +37,14 @@
  * endpoint.
  */
 import https from "node:https";
-import { createRequire } from "node:module";
+import { directCredentials } from "./direct-credentials.js";
 import { validateHeaderValue } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
-import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
+import { memtreeStorageIdentity } from "./config.js";
+import { RecallWork, waitForRecall, withRecallReceipt } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -543,6 +544,15 @@ export async function refreshHostSession(deps, hostPid = process.ppid) {
     if (typeof sessionId === "string" && sessionId)
         deps.sessionId = sessionId;
 }
+function claudePidFile(env, hostPid) {
+    const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+    return path.join(dir, "sessions", `${hostPid}.json`);
+}
+function claudePidSession(json, hostPid) {
+    const record = JSON.parse(json);
+    if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId)
+        return record.sessionId;
+}
 /**
  * The desktop service can't name a process's session the way terminal ccc's proxy does
  * (refreshHostSession), so read Claude Code's own record of its process (`<config
@@ -550,14 +560,35 @@ export async function refreshHostSession(deps, hostPid = process.ppid) {
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
 export function refreshSessionFromClaudePidFile(deps, env, hostPid = process.ppid) {
-    const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
     try {
-        const record = JSON.parse(fs.readFileSync(path.join(dir, "sessions", `${hostPid}.json`), "utf8"));
-        if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
-            deps.sessionId = record.sessionId;
-        }
+        const id = claudePidSession(fs.readFileSync(claudePidFile(env, hostPid), "utf8"), hostPid);
+        if (id)
+            deps.sessionId = id;
     }
-    catch { /* no record: keep the launch id */ }
+    catch { /* No readable record: keep the current session. */ }
+}
+/** Direct mode has no current tree. Only recall notices need its Claude session. */
+export function watchClaudeSession(env, hostPid = process.ppid) {
+    const file = claudePidFile(env, hostPid);
+    let lastKnown;
+    async function read() {
+        try {
+            lastKnown = claudePidSession(await fs.promises.readFile(file, "utf8"), hostPid) ?? lastKnown;
+        }
+        catch { /* Missing or partially written PID record: keep the last known session. */ }
+        return lastKnown;
+    }
+    let current = read();
+    // watchFile also follows atomic replacement and a file first created after MCP startup.
+    const changed = (stat) => {
+        if (stat.nlink)
+            current = current.then(read);
+    };
+    fs.watchFile(file, { persistent: false, interval: 250 }, changed);
+    return {
+        snapshot: () => current,
+        close: () => fs.unwatchFile(file, changed),
+    };
 }
 function proxyBase(deps) {
     const base = deps.proxyUrl?.replace(/\/$/, "");
@@ -660,7 +691,7 @@ export class CurrentTree {
                 if (!other && session !== undefined)
                     this.checkSession(session, this.requireSessionId());
                 if (other || session !== undefined) {
-                    return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes);
+                    return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes, session);
                 }
                 // Older servers omit identity: search only the session-validated page.
             }
@@ -995,7 +1026,7 @@ versionNote,
 /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
 notice, 
 /** Not in a ccc-routed session: no tools, no instructions. */
-inert = false, direct = false) {
+inert = false, direct = false, invocation) {
     if (!isRpcRequest(input)) {
         return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
     }
@@ -1031,8 +1062,9 @@ inert = false, direct = false) {
                 return note ? `${text}\n\n${note}` : text;
             };
             try {
-                const text = await callTool(String(name), args, tree, finder);
-                return reply({ content: [{ type: "text", text: withNotice(text) }] });
+                const meta = message.params?._meta;
+                const text = await withRecallReceipt(String(name), meta?.["claudecode/toolUseId"], () => callTool(String(name), args, tree, finder).then(withNotice), invocation);
+                return reply({ content: [{ type: "text", text }] });
             }
             catch (err) {
                 if (err instanceof UnknownToolError)
@@ -1245,50 +1277,7 @@ async function readLinesTool(args, tree) {
     const pick = (v, fallback) => (v === undefined || v === null ? fallback : Number(v));
     return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
-// These switches only suppress warnings, include their call stacks, or turn off
-// the inspector signal. The one valued flag only sets a numeric V8 heap limit.
-const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation"];
-if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1"))
-    DIRECT_NODE_SWITCHES.push("--disable-sigusr1");
 const DIRECT_USAGE = "Usage: ccc memtree-mcp --direct [--env staging|production]";
-function nodeOptionsArgs(options) {
-    // Node splits on spaces outside double quotes. A backslash escapes the next
-    // character only inside quotes. Leave all other characters literal.
-    const args = [];
-    let quoted = false;
-    let arg = "";
-    for (let i = 0; i < options.length; i++) {
-        const c = options[i];
-        if (c === '"')
-            quoted = !quoted;
-        else if (quoted && c === "\\")
-            arg += options[++i] ?? "";
-        else if (!quoted && c === " ") {
-            if (arg)
-                args.push(arg);
-            arg = "";
-        }
-        else
-            arg += c;
-    }
-    // Node normally rejects unterminated quotes before it reaches the entry point.
-    if (quoted)
-        throw new Error("Invalid quoting in NODE_OPTIONS.");
-    if (arg)
-        args.push(arg);
-    return args;
-}
-function checkDirectNodeFlags(args, source) {
-    for (const arg of args) {
-        if (DIRECT_NODE_SWITCHES.includes(arg) || /^--(?:max-old-space-size|max_old_space_size)=[0-9]+$/.test(arg))
-            continue;
-        const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
-        const fix = source === "NODE_OPTIONS"
-            ? "Remove the flag from NODE_OPTIONS or clear NODE_OPTIONS in this MCP server's environment."
-            : "Remove the flag from the Node command line.";
-        throw new Error(`Unsupported Node flag ${name} in ${source}. ${fix} MemTree direct mode accepts only --max-old-space-size=N (or --max_old_space_size=N), ${DIRECT_NODE_SWITCHES.join(", ")}.`);
-    }
-}
 function directEnvironment(args, defaultEnv) {
     try {
         const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
@@ -1310,46 +1299,20 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     const inert = desktop && !target;
     let deps;
     if (direct) {
-        if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
-            throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
-        }
-        // Diagnostics can log raw traffic or capture the saved key from memory.
-        if (env.NODE_DEBUG !== undefined) {
-            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
-        }
-        try {
-            checkDirectNodeFlags(process.execArgv, "Node command line");
-            checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""), "NODE_OPTIONS");
-        }
-        catch (err) {
-            console.error(err instanceof Error ? err.message : "Invalid Node startup flags.");
-            process.exitCode = 1;
-            return;
-        }
         const mode = directEnvironment(args, defaultEnv);
         if (!mode) {
             console.error(DIRECT_USAGE);
             process.exitCode = 1;
             return;
         }
-        // Node 20 lacks --disable-sigusr1. Claim the signal before loading the key.
-        if (process.platform !== "win32")
-            process.on("SIGUSR1", () => { });
-        // The inspector might already be listening. Some Node builds omit it entirely.
-        if (process.features.inspector) {
-            const inspector = createRequire(import.meta.url)("node:inspector");
-            if (inspector.url()) {
-                console.error("The Node inspector is already listening. Restart the MemTree MCP server with debugging disabled.");
-                process.exitCode = 1;
-                return;
-            }
+        try {
+            deps = { direct: directCredentials(mode, env) };
         }
-        const savedKey = storedApiKey(mode, { warnOnLegacy: false });
-        const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
-        if (!apiKey) {
-            throw new Error(`No MemTree key saved for ${mode}. Run ccc${mode === "staging" ? " staging" : ""} to save one.`);
+        catch (err) {
+            console.error(err instanceof Error ? err.message : "MemTree credentials unavailable.");
+            process.exitCode = 1;
+            return;
         }
-        deps = { direct: { baseUrl: memtreeBaseUrlFor(mode), apiKey } };
     }
     else {
         deps = {
@@ -1359,6 +1322,8 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
             ...(target?.token ? { token: target.token } : {}),
         };
     }
+    const account = deps.direct ? memtreeStorageIdentity(deps.direct.baseUrl, deps.direct.apiKey)
+        : deps.proxyUrl && deps.proxyUrl === env.CCC_RECALL_PROXY_URL ? env.CCC_RECALL_ACCOUNT : undefined;
     const tree = new CurrentTree(deps);
     const finder = new SessionFinder(deps);
     const versionNote = direct ? undefined : versionMismatchNote(env[PROXY_VERSION_ENV]);
@@ -1368,10 +1333,20 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     let buffer = "";
     // Replies go out in arrival order even though tool calls are async.
     let queue = Promise.resolve();
+    const receipts = new RecallWork();
+    let recallPid;
+    const recallSession = () => {
+        if (!direct)
+            return deps.sessionId;
+        recallPid ??= watchClaudeSession(env);
+        return recallPid.snapshot().then(id => id ?? env.CLAUDE_CODE_SESSION_ID);
+    };
     // An upstream error or transcript may echo the saved credential.
     const key = deps.direct?.apiKey;
     const redactKey = (_name, value) => key && typeof value === "string" ? redact(value, key) : value;
-    const send = (message) => process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`);
+    const send = (message) => new Promise(resolve => {
+        process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`, error => resolve(!error));
+    });
     process.stdin.setEncoding("utf-8");
     process.stdin.on("data", (chunk) => {
         buffer += chunk;
@@ -1396,19 +1371,33 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                     if (desktop)
                         refreshSessionFromClaudePidFile(deps, env);
                 }
-                const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct)
+                let publish;
+                const invocation = account ? {
+                    account, session: recallSession, afterReply: write => { publish = write; },
+                } : undefined;
+                const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct, invocation)
                     .catch((err) => ({
                     jsonrpc: "2.0",
                     id: isRpcRequest(message) ? message.id ?? null : null,
                     error: { code: -32603, message: String(err) },
                 }));
-                if (response)
-                    send(response);
+                if (!response)
+                    return;
+                const sent = send(response);
+                const writeReceipt = publish;
+                if (writeReceipt)
+                    receipts.start(async (signal) => {
+                        if (await sent)
+                            await writeReceipt(signal);
+                    });
             });
         }
     });
     process.stdin.on("end", () => {
-        void queue.then(() => process.exit(0));
+        void queue.then(() => {
+            recallPid?.close();
+            return waitForRecall(receipts.settle());
+        }).then(() => process.exit(0));
     });
 }
 function isToolCall(message) {

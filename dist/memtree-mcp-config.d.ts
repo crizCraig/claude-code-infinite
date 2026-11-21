@@ -8,7 +8,7 @@ export declare function memtreeMcpEnabledByEnv(env: NodeJS.ProcessEnv): boolean;
 /** Prefer a stable installation symlink only if it identifies the running binary.
  * Never obtain the registered command from PATH or the working directory. */
 export declare function directMcpNodePath(realNode: string): string;
-export declare function formatDirectMcpConfig(format: "codex" | "json", command: string, cli: string, mode: "production" | "staging"): string;
+export declare function formatDirectMcpConfig(format: "codex" | "json" | "claude-hooks", command: string, cli: string, mode: "production" | "staging"): string;
 export declare function printDirectMcpConfig(args: string[], defaultEnv: CccEnvironment): number;
 /** The `--mcp-config` JSON for this ccc's server, bound to its proxy. */
 export declare function memtreeMcpConfig(proxyUrl: string, hostToken?: string): object;

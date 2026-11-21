@@ -17,6 +17,7 @@
  * stale compression result.
  */
 
+import { memtreeStorageIdentity } from "./config.js";
 import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply, type FinalReplyReader } from "./final-index.js";
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
@@ -1204,8 +1205,7 @@ export class MemtreeClient {
    * for the identity that wrote it (prefix-store.ts).
    */
   get storageIdentity(): string {
-    const keyHash = createHash("sha256").update(this.apiKey).digest("hex");
-    return createHash("sha256").update(`${this.baseUrl}\n${keyHash}`).digest("hex");
+    return memtreeStorageIdentity(this.baseUrl, this.apiKey);
   }
 
   /** The budget for a compress with nothing else to send (no fallback). */

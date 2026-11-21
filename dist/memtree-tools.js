@@ -18,6 +18,7 @@
  * A result that has no time says "time not recorded" once instead of nothing.
  */
 import { blockTimes, bracketedSpan, ClockFormat, formatTime, formatTimeSpan, lineTimes, linesSpan, mergeSpans, MissingTimeNote, timeAt, timeSpan, } from "./memtree-times.js";
+import { collectRecalls, recallPassage } from "./recall.js";
 export const SEARCH_DEFAULT_LIMIT = 10;
 export const SEARCH_MAX_LIMIT = 50;
 export const READ_LINES_MAX_LINES = 400;
@@ -98,6 +99,9 @@ export class MemtreeIndex {
     }
     blockLines(block) {
         return this.lines[block];
+    }
+    sessionTime() {
+        return this.times.get(0)?.[0] ?? this.page.tree_created_at ?? this.page.created_at;
     }
     /** Root first, the node's parent last. */
     ancestors(id) {
@@ -265,7 +269,7 @@ export function formatSearch(index, query, limit, tree) {
     const terms = queryTerms(query);
     if (!terms.length)
         throw new ToolInputError("search: the query has no searchable terms");
-    return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree, [], index.times.get(0));
+    return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree, [], index.times.get(0), index.page.session_id, index);
 }
 /**
  * The hits of the server's term search over one tree
@@ -311,9 +315,20 @@ function serverSnippets(raw) {
 }
 export function formatSearchHits(hits, query, terms, tree, tailHits = [], 
 /** When the tree's messages were written, first to last: said in the header. */
-treeTimes) {
+treeTimes, session, index) {
     if (!terms.length)
         throw new ToolInputError("search: the query has no searchable terms");
+    collectRecalls(() => {
+        for (const hit of hits) {
+            const at = hit.times?.[0] ?? hit.snippets.find(s => s.at)?.at ?? treeTimes?.[0] ?? index?.sessionTime();
+            if (hit.summary || hit.snippets.length)
+                recallPassage(session, hit.summary, at);
+        }
+        for (const hit of tailHits) {
+            if (hit.snippets.length)
+                recallPassage(session, "", hit.at ?? treeTimes?.[0] ?? index?.sessionTime());
+        }
+    });
     if (!hits.length && tailHits.length) {
         return [`No node of the tree matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}).`,
             ...formatTailHits(tailHits, tree)].join("\n");
@@ -399,6 +414,11 @@ export function formatNode(index, id, tree) {
             out.push(`  node ${child} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
         }
     }
+    collectRecalls(() => {
+        if (node.s?.trim() || [...path, ...children].some(n => index.nodes.get(n)?.s?.trim())) {
+            recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.sessionTime());
+        }
+    });
     return out.join("\n");
 }
 /**
@@ -466,6 +486,12 @@ export function formatLines(index, block, start, end, tree) {
         rows.push([n, text]);
         shown = n;
     }
+    collectRecalls(() => {
+        if (!rows.some(([, text]) => text.trim() && !MESSAGE_HEADER_RE.test(text)))
+            return;
+        const leaf = Array.from(index.nodes.values()).find(n => n.l?.[0] === block && n.l[1] <= start && n.l[2] >= start);
+        recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title, index.rangeSpan(block, start, shown)?.[0] ?? index.sessionTime());
+    });
     const wanted = Math.min(end, lines.length);
     if (shown < wanted) {
         notes.unshift(`capped at ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} chars per call: showed ${start}-${shown}; ` +
@@ -550,6 +576,13 @@ export function formatTail(body, tree) {
     if (!messages.length) {
         return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}).`;
     }
+    collectRecalls(() => {
+        const useful = messages.filter(m => typeof m.x === "string" && m.x.trim());
+        if (useful.length) {
+            const at = useful.find(m => m.at)?.at ?? messages.find(m => m.at)?.at ?? page.tree_created_at ?? page.created_at;
+            recallPassage(page.session_id, page.title, at);
+        }
+    });
     const first = messages[0].i;
     const last = messages[messages.length - 1].i;
     const from = page.not_indexed_from;

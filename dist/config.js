@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -93,5 +94,10 @@ export function memtreeBaseUrlFor(mode, env = process.env) {
     return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
+}
+/** Namespace local state by backend and account, without persisting the credential. */
+export function memtreeStorageIdentity(baseUrl, apiKey) {
+    const keyHash = createHash("sha256").update(apiKey).digest("hex");
+    return createHash("sha256").update(baseUrl + "\n" + keyHash).digest("hex");
 }
 //# sourceMappingURL=config.js.map

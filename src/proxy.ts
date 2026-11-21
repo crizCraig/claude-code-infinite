@@ -179,8 +179,9 @@ import {
 } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
 import {
-  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX,
+  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX,
 } from "./hooks.js";
+import { beginRecall, recalled, wrappedRecallWork, settleRecallWork, waitForRecall, WrappedRecallHistory, recallLine, type RecallBatch } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -248,6 +249,7 @@ const SKIP_RESPONSE_HEADERS = new Set([
 ]);
 
 export interface ProxyOptions {
+  visibleRecall?: boolean;
   memtree: MemtreeClient;
   /**
    * Treat current native-1M Anthropic model ids as 1M without requiring the
@@ -543,8 +545,25 @@ interface MemtreePage {
   seq: number;
 }
 
+interface SessionRecalls {
+  prompt?: string;
+  agents: Set<string>;
+  pending: { agent?: string; batch?: RecallBatch; verifying: boolean }[];
+}
+
+function sessionRecalls(sessions: Map<string, SessionRecalls>, id: string): SessionRecalls {
+  let state = sessions.get(id);
+  if (!state) {
+    state = { agents: new Set(), pending: [] };
+    sessions.set(id, state);
+  }
+  return state;
+}
+
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
+  recall?: Map<string, SessionRecalls>;
+  recallHistory: WrappedRecallHistory;
   /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
   threadRefusals: ThreadRefusals;
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
@@ -1182,6 +1201,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const backgroundAbort = new AbortController();
   const state: ProxyState = {
+    recall: opts.visibleRecall ? new Map() : undefined,
+    recallHistory: new WrappedRecallHistory(),
     threadRefusals: new ThreadRefusals(),
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
@@ -1333,6 +1354,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       while (activeRequests.size > 0) {
         await Promise.allSettled([...activeRequests]);
       }
+      if (state.recall) await waitForRecall(settleRecallWork());
     })();
     let timer: NodeJS.Timeout | undefined;
     const completed = await Promise.race([
@@ -1415,6 +1437,45 @@ async function handleRequest(
   }
   if (url.pathname === `${hookPath}${RESUME_GUIDANCE_HOOK_SUFFIX}`) {
     return handleSessionStartContextHook(req, res, (input) => resumeGuidanceContext(state, input));
+  }
+  if (url.pathname === hookPath + RECALL_HOOK_SUFFIX) {
+    const raw = req.method === "POST" ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
+    if (!raw) req.resume();
+    const recall = state.recall;
+    if (raw && recall) {
+      try {
+        const input = JSON.parse(raw.toString("utf8"));
+        if (input.hook_event_name === "PreToolUse") {
+          // A Stop hook can ask Claude to continue the same prompt without another submit.
+          if (!input.agent_id && input.session_id && input.prompt_id) {
+            sessionRecalls(recall, input.session_id).prompt ??= input.prompt_id;
+          }
+          void beginRecall(input, opts.memtree.storageIdentity).catch(() => {});
+          res.writeHead(204).end();
+          return;
+        }
+        const session = recall.get(input.session_id);
+        if (session && (input.agent_id ? session.agents.has(input.agent_id) : input.prompt_id === session.prompt)) {
+          const call: SessionRecalls["pending"][number] = { agent: input.agent_id, verifying: true };
+          const prompt = session.prompt;
+          const task = wrappedRecallWork.start(async signal => {
+            const batch = await recalled(input, opts.memtree.storageIdentity);
+            if (!batch || signal.aborted || !session.pending.includes(call)) return;
+            if (input.agent_id) await state.recallHistory.prepareAgent(input.session_id);
+            if (prompt) await state.recallHistory.prepare(input.session_id, prompt, signal);
+            call.batch = batch;
+          });
+          if (task) {
+            session.pending.push(call);
+            // Stop can follow this hook immediately. Give verification time to claim
+            // a receipt published after the tool reply, while bounding a stalled hook.
+            await waitForRecall(task.finally(() => { call.verifying = false; }));
+          }
+        }
+      } catch { /* Optional UI; never return hook feedback to the model. */ }
+    }
+    res.writeHead(204).end();
+    return;
   }
   if (url.pathname === `${hookPath}${SUBAGENT_RESULT_HOOK_SUFFIX}`) {
     return handleSubagentResultHook(req, res, state);
@@ -2100,6 +2161,13 @@ async function handleNoticeHook(
       return;
     }
     if (parsed.agent_id === undefined) {
+      if (state.recall && parsed.prompt_id) {
+        const session = sessionRecalls(state.recall, parsed.session_id);
+        if (session.prompt !== parsed.prompt_id) {
+          session.prompt = parsed.prompt_id;
+          session.pending = session.pending.filter(call => call.agent);
+        }
+      }
       state.promptAccounting.add(parsed.session_id, parsed.prompt_id, parsed.prompt);
       recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
     }
@@ -2122,6 +2190,7 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStart") {
+    if (state.recall) sessionRecalls(state.recall, parsed.session_id).agents.add(parsed.agent_id);
     state.activeSubagents.add(parsed.agent_id);
     const hint = await subagentHintContext(state, parsed.session_id);
     if (hint === undefined) {
@@ -2139,6 +2208,11 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStop") {
+    const session = state.recall?.get(parsed.session_id);
+    if (session) {
+      session.agents.delete(parsed.agent_id);
+      if (!session.prompt && !session.agents.size && !session.pending.length) state.recall?.delete(parsed.session_id);
+    }
     state.activeSubagents.delete(parsed.agent_id);
     sendDeferredAgentIndex(state, parsed.agent_id);
     res.writeHead(204);
@@ -2153,7 +2227,7 @@ async function handleNoticeHook(
       parsed.prompt_id === undefined ||
       state.mainPromptId === parsed.prompt_id ||
       (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
-  const output =
+  let output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
       ? null
       : state.notices.claim(parsed);
@@ -2166,6 +2240,26 @@ async function handleNoticeHook(
     // delivery callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
     // Subagent lifetimes are independent; only their own stop events retire them.
+  }
+  if (parsed.hook_event_name === "Stop" && !parsed.agent_id && parsed.prompt_id) {
+    const session = state.recall?.get(parsed.session_id);
+    if (session && (!session.prompt || session.prompt === parsed.prompt_id)) {
+      // Stop only consumes verified batches. A late host result belongs to the finished prompt.
+      const pending = session.pending;
+      session.prompt = undefined;
+      const batches = pending.flatMap(call => call.batch ?? []);
+      let displayed = false;
+      try {
+        const line = recallLine(batches);
+        if (line && state.recallHistory.claim(parsed.session_id, parsed.prompt_id)) {
+          const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
+          output = { systemMessage: joinNoticeLines(line, existing)! };
+          displayed = true;
+        }
+      } catch { /* Preserve the ordinary Stop output on any recall formatting error. */ }
+      session.pending = pending.filter(call => call.agent && (call.verifying || (!displayed && call.batch)));
+      if (!session.agents.size && !session.pending.length) state.recall?.delete(parsed.session_id);
+    }
   }
   if (!output) {
     res.writeHead(204);

@@ -61,6 +61,7 @@ export declare class MemtreeIndex {
     lineTime(block: number, line: number): string | undefined;
     get blockCount(): number;
     blockLines(block: number): string[] | undefined;
+    sessionTime(): unknown;
     /** Root first, the node's parent last. */
     ancestors(id: number): number[];
     isLeaf(node: MemtreeNode): boolean;
@@ -120,7 +121,7 @@ export declare function serverSearchHits(body: unknown): {
 } | undefined;
 export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string, tailHits?: TailHit[], 
 /** When the tree's messages were written, first to last: said in the header. */
-treeTimes?: TimeSpan): string;
+treeTimes?: TimeSpan, session?: unknown, index?: MemtreeIndex): string;
 export declare function formatNode(index: MemtreeIndex, id: number, tree?: string): string;
 export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number, tree?: string): string;
 /** A tail message matching a tree search (`tail_hits`, polychat memtree_tail_search.py). */

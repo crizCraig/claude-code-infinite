@@ -15,6 +15,8 @@ export declare const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
  * earlier-sessions block, never a user-facing line.
  */
 export declare const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
+/** PostToolUse for the three recall tools. */
+export declare const RECALL_HOOK_SUFFIX = "/recall";
 /** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
 export declare const SUBAGENT_RESULT_HOOK_SUFFIX = "/subagent-result";
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
@@ -332,6 +334,7 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
     interceptCompact?: boolean;
     /** Point the parent at a finished subagent's tree (PostToolUse on Agent|Task). */
     subagentResult?: boolean;
+    recall?: boolean;
 }): SessionNoticePlugin;
 /**
  * A plugin with only the SessionStart banner, for a session that runs without the

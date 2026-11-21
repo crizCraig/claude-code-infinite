@@ -16,6 +16,7 @@
  * amplify identical HTTP calls, and budget-changing inputs never reuse a
  * stale compression result.
  */
+import { memtreeStorageIdentity } from "./config.js";
 import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
@@ -935,8 +936,7 @@ export class MemtreeClient {
      * for the identity that wrote it (prefix-store.ts).
      */
     get storageIdentity() {
-        const keyHash = createHash("sha256").update(this.apiKey).digest("hex");
-        return createHash("sha256").update(`${this.baseUrl}\n${keyHash}`).digest("hex");
+        return memtreeStorageIdentity(this.baseUrl, this.apiKey);
     }
     /** The budget for a compress with nothing else to send (no fallback). */
     get longCompressBudgetMs() {

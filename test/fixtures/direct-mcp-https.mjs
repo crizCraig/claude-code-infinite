@@ -14,6 +14,77 @@ import { rootCertificates } from "node:tls";
 
 if (process.env.TEST_INSPECTOR_LISTENING === "1") inspector.url = () => "ws://127.0.0.1:9229/test";
 
+// Keep the selected lookup pending until every tool and the queued ping have replied.
+if (process.env.STALL_RECALL_READ) {
+  const kind = process.env.STALL_RECALL_READ;
+  const matches = file => typeof file === "string" && (kind === "pid"
+    ? path.basename(file) === process.ppid + ".json" : path.basename(path.dirname(file)) === "recall-notices");
+  const sync = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    if (matches(file)) throw new Error("synchronous " + kind + " read");
+    return sync(file, ...args);
+  };
+  let release;
+  const ping = new Promise(resolve => { release = resolve; });
+  let reads = 0;
+  const read = fs.promises.readFile;
+  fs.promises.readFile = async (file, ...args) => {
+    if (matches(file)) {
+      reads++;
+      await ping;
+    }
+    return read(file, ...args);
+  };
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (line, ...args) => {
+    const flushed = write(line, ...args);
+    if (JSON.parse(line).id === "ping") release();
+    return flushed;
+  };
+  process.on("exit", () => {
+    assert.equal(reads, kind === "pid" ? 1 : 6, "lookup count for " + kind);
+  });
+}
+
+if (process.env.STALL_RECEIPT === "1") {
+  let replied = false;
+  let stalled = false;
+  let ping = false;
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (line, ...args) => {
+    if (JSON.parse(line).id === 0) {
+      const callback = args.at(-1);
+      // Simulate backpressure on a large result. Later requests can still run.
+      return write(line, () => setTimeout(() => {
+        replied = true;
+        callback?.();
+      }, 40));
+    }
+    if (JSON.parse(line).id === 1) ping = true;
+    return write(line, ...args);
+  };
+  fs.promises.rename = async () => {
+    assert.ok(replied, "publication started before stdout flushed the tool reply");
+    stalled = true;
+    setTimeout(() => process.exit(88), 2000);
+    await new Promise(() => {});
+  };
+  process.on("exit", () => {
+    assert.ok(stalled, "the fixture never attempted publication");
+    assert.ok(ping, "receipt publication blocked the queued ping");
+  });
+}
+
+if (process.env.CHECK_PID_UNREAD === "1") {
+  for (const [api, method] of [[fs, "readFileSync"], [fs.promises, "readFile"]]) {
+    const read = api[method];
+    api[method] = (file, ...args) => {
+      if (typeof file === "string" && path.basename(file) === process.ppid + ".json") process.exit(85);
+      return read(file, ...args);
+    };
+  }
+}
+
 if (process.env.CHECK_NO_SPAWN === "1") {
   for (const method of ["exec", "execFile", "execSync", "execFileSync", "fork", "spawn", "spawnSync"]) {
     childProcess[method] = () => {

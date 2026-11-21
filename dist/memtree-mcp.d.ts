@@ -1,4 +1,5 @@
 import type { CccEnvironment } from "./cli-args.js";
+import { type RecallInvocation } from "./recall.js";
 import { type FinderSearchMode } from "./memtree-finder.js";
 import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
@@ -409,6 +410,11 @@ export declare function refreshHostSession(deps: MemtreeMcpDeps, hostPid?: numbe
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
 export declare function refreshSessionFromClaudePidFile(deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid?: number): void;
+/** Direct mode has no current tree. Only recall notices need its Claude session. */
+export declare function watchClaudeSession(env: NodeJS.ProcessEnv, hostPid?: number): {
+    snapshot: () => Promise<string | undefined>;
+    close: () => void;
+};
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
@@ -521,7 +527,7 @@ notice?: {
     next(): string | undefined;
 }, 
 /** Not in a ccc-routed session: no tools, no instructions. */
-inert?: boolean, direct?: boolean): Promise<object | undefined>;
+inert?: boolean, direct?: boolean, invocation?: RecallInvocation): Promise<object | undefined>;
 export declare const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
 /** After a refusal the default stays text this long, then hybrid is tried again (a setting can flip). */
 export declare const HYBRID_OFF_RECHECK_MS: number;

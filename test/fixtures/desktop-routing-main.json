@@ -1,0 +1,50 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "block 0 [time not recorded] lines 1-1 (line number, tab, exact text):\n1\ttranscript a"
+        }
+      ]
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "block 0 [time not recorded] lines 1-1 (line number, tab, exact text):\n1\ttranscript b"
+        }
+      ]
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "node 0 · leaf · depth 0 [time not recorded]\nsummary: summary b\ntranscript: block 0 lines 1-1 (1 lines; read_lines {\"block\": 0, \"start\": 1, \"end\": 1})"
+        }
+      ]
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "1 best match for \"transcript\" (terms: transcript):\n\n[node 0 · leaf · depth 0 · block 0 lines 1-1 · time not recorded · matched transcript · 1 matching line]\n  summary b\n  L1: transcript b\n\nSummaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root."
+        }
+      ]
+    }
+  }
+]

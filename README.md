@@ -110,6 +110,19 @@ Hits name their node, so Claude goes from a search hit to the summary around it 
 exact lines. Type `/memtree-view` to open this session's tree in your browser. Details are under
 [Memory tools](#memory-tools).
 
+In interactive Claude Code, a successful recall gets one line at the end of the turn:
+
+```text
+🌿 MemTree recalled from Tuesday’s session: Billing service deployment …and 2 more
+```
+
+Only passages from a different Claude session qualify. Each prompt can show one
+line, which names the first qualifying passage and counts the others. Dates use
+your local calendar. An undated past session is labeled “a past session.” A late
+background recall can appear at the next parent Stop. The exit summary counts
+past-session passages across resumes for the same MemTree account and Claude session.
+Set `CCC_RECALL_NOTICE=0` to turn off recall notices and counting.
+
 ### Read ccc sessions from Codex or another MCP client
 
 Generate the registration from a trusted directory.
@@ -144,6 +157,15 @@ Direct mode uses the production key saved in `~/.claude-code-infinite/config.jso
 Add `--env staging` to use your saved staging key. Direct reads connect to MemTree over HTTPS
 using Node’s bundled CA certificates and bypass environment proxies. Use `list` or an unscoped `search`
 to find a tree or session id, then pass it to the read tools. Direct mode has no `current` tree.
+
+When launching plain Claude Code with the direct MCP registration, also merge
+the output of `ccc memtree-mcp --print-config --format claude-hooks` into your
+Claude Code settings, or save it as a file and pass `--settings <file>` to Claude
+Code. For a staging registration, add `--env staging` when generating the hooks
+too. Interactive `ccc` installs them for its session automatically, including
+when you supply a direct MCP config.
+The synchronous Stop hook emits only a user-facing `systemMessage`. The MCP
+result and subsequent model requests carry the same content with notices on or off.
 
 Direct mode checks Node startup flags before reading the saved key. It accepts
 `--max-old-space-size=N` or `--max_old_space_size=N` (heap limit), `--no-warnings` (suppress warnings),
