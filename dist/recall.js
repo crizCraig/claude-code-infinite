@@ -29,6 +29,8 @@ function key(...ids) {
     return createHash("sha256").update(JSON.stringify(ids)).digest("hex");
 }
 const files = fs.promises;
+// The writer's lookup budget also determines how long a hook retries a missing receipt.
+const RECEIPT_DEADLINE_MS = 200;
 const ttl = 10 * 60_000;
 let lastPruned = 0;
 async function prune(dir) {
@@ -49,7 +51,7 @@ async function prune(dir) {
     }
 }
 // Bound optional work after a reply or during shutdown.
-export async function waitForRecall(work, timeoutMs = 250) {
+export async function waitForRecall(work, timeoutMs = RECEIPT_DEADLINE_MS + 50) {
     let timer;
     try {
         const deadline = new Promise(resolve => {
@@ -168,7 +170,7 @@ export async function withRecallReceipt(tool, id, answer, invocation) {
                 return { file: receiptFile(invocation.account, session, name, id, ticket.nonce), past };
             };
             try {
-                const authorization = await waitForRecall(findReceipt(), 200);
+                const authorization = await waitForRecall(findReceipt(), RECEIPT_DEADLINE_MS);
                 if (!authorization)
                     return;
                 void prune(receiptsDir()).catch(() => { });
@@ -251,13 +253,26 @@ export async function recalled(input, account) {
         !input.tool_name || !matcher.test(input.tool_name) || !input.session_id || !input.prompt_id ||
         typeof input.tool_use_id !== "string" || !input.tool_use_id)
         return;
+    const deadline = performance.now() + RECEIPT_DEADLINE_MS;
+    const pending = publishingTickets.get(ticketFile(input.session_id, input.tool_name, input.tool_use_id));
+    // Wrapped PreToolUse may still be replacing an older ticket for this ID.
+    // readTicket rejects the old nonce if the replacement fails or times out.
+    if (pending)
+        await waitForRecall(pending.catch(() => { }), RECEIPT_DEADLINE_MS);
     const ticket = await readTicket(account, input.session_id, input.tool_name, input.tool_use_id);
     if (!ticket || input.prompt_id !== ticket.prompt || input.agent_id !== ticket.agent)
         return;
     const file = receiptFile(account, input.session_id, input.tool_name, input.tool_use_id, ticket.nonce);
     let receipt;
     try {
-        receipt = await claim(file);
+        for (;;) {
+            // Always make a final claim at or after the deadline, even if the timer woke late.
+            const lastAttempt = performance.now() >= deadline;
+            receipt = await claim(file);
+            if (receipt || lastAttempt)
+                break;
+            await new Promise(resolve => setTimeout(resolve, Math.min(20, deadline - performance.now())));
+        }
         if (!receipt || !(receipt.at <= Date.now() && receipt.at >= Date.now() - ttl) ||
             !Array.isArray(receipt.passages) || !await matchesAnswer(input, receipt))
             return;
@@ -390,7 +405,7 @@ export async function standaloneRecall(input, account) {
     const agents = key("agents", account, input.session_id);
     const dir = path.join(receiptsDir(), key("pending-past", account, input.session_id));
     if (input.hook_event_name === "PostToolUse") {
-        const batch = await recalled(input, account);
+        const batch = await waitForRecall(recalled(input, account));
         if (batch) {
             const name = (input.agent_id ? agents : host) + "." + Date.now() + "." + randomUUID();
             await publishFile(path.join(dir, name), batch);

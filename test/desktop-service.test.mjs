@@ -366,7 +366,7 @@ test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)
   assert.doesNotMatch(launchdPlist("local", paths, "/x/cli.js"), /NODE_EXTRA_CA_CERTS/);
 });
 
-test("the desktop MCP server follows its Claude Code's session file after /clear (review r1 P2)", async (t) => {
+test("direct recall tracks Claude’s PID record and ignores records for other processes", async (t) => {
   const { watchClaudeSession } = await import("../dist/memtree-mcp.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-pidfile-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

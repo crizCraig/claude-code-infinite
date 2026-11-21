@@ -643,22 +643,38 @@ export async function refreshHostSession(
   if (typeof sessionId === "string" && sessionId) deps.sessionId = sessionId;
 }
 
+function claudePidFile(env: NodeJS.ProcessEnv, hostPid: number): string {
+  const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+  return path.join(dir, "sessions", `${hostPid}.json`);
+}
+
+function claudePidSession(json: string, hostPid: number): string | undefined {
+  const record = JSON.parse(json);
+  if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) return record.sessionId;
+}
+
 /**
  * The desktop service can't name a process's session the way terminal ccc's proxy does
  * (refreshHostSession), so read Claude Code's own record of its process (`<config
  * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
+export function refreshSessionFromClaudePidFile(
+  deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid = process.ppid
+): void {
+  try {
+    const id = claudePidSession(fs.readFileSync(claudePidFile(env, hostPid), "utf8"), hostPid);
+    if (id) deps.sessionId = id;
+  } catch { /* No readable record: keep the current session. */ }
+}
+
+/** Direct mode has no current tree. Only recall notices need its Claude session. */
 export function watchClaudeSession(env: NodeJS.ProcessEnv, hostPid = process.ppid) {
-  const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
-  const file = path.join(dir, "sessions", `${hostPid}.json`);
+  const file = claudePidFile(env, hostPid);
   let lastKnown: string | undefined;
   async function read() {
     try {
-      const record = JSON.parse(await fs.promises.readFile(file, "utf8"));
-      if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
-        lastKnown = record.sessionId;
-      }
+      lastKnown = claudePidSession(await fs.promises.readFile(file, "utf8"), hostPid) ?? lastKnown;
     } catch { /* Missing or partially written PID record: keep the last known session. */ }
     return lastKnown;
   }
@@ -669,7 +685,6 @@ export function watchClaudeSession(env: NodeJS.ProcessEnv, hostPid = process.ppi
   };
   fs.watchFile(file, { persistent: false, interval: 250 }, changed);
   return {
-    get latest() { return lastKnown; },
     snapshot: () => current,
     close: () => fs.unwatchFile(file, changed),
   };
@@ -1490,12 +1505,11 @@ export function runMemtreeMcpServer(
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
   const receipts = new RecallWork();
-  let pidSession = desktop && !inert ? watchClaudeSession(env) : undefined;
+  let recallPid: ReturnType<typeof watchClaudeSession> | undefined;
   const recallSession = () => {
-    // Direct mode uses the PID file only for notices. Never send its id upstream.
-    if (direct) pidSession ??= watchClaudeSession(env);
-    const fallback = deps.sessionId ?? env.CLAUDE_CODE_SESSION_ID;
-    return pidSession ? pidSession.snapshot().then(id => id ?? fallback) : fallback;
+    if (!direct) return deps.sessionId;
+    recallPid ??= watchClaudeSession(env);
+    return recallPid.snapshot().then(id => id ?? env.CLAUDE_CODE_SESSION_ID);
   };
   // An upstream error or transcript may echo the saved credential.
   const key = deps.direct?.apiKey;
@@ -1523,7 +1537,7 @@ export function runMemtreeMcpServer(
         // Calls run one at a time, so each reads the session its process is on now.
         if (isToolCall(message) && !direct && !inert) {
           await refreshHostSession(deps);
-          if (pidSession?.latest) deps.sessionId = pidSession.latest;
+          if (desktop) refreshSessionFromClaudePidFile(deps, env);
         }
         let publish: ((signal?: AbortSignal) => Promise<void>) | undefined;
         const invocation: RecallInvocation | undefined = account ? {
@@ -1546,7 +1560,7 @@ export function runMemtreeMcpServer(
   });
   process.stdin.on("end", () => {
     void queue.then(() => {
-      pidSession?.close();
+      recallPid?.close();
       return waitForRecall(receipts.settle());
     }).then(() => process.exit(0));
   });

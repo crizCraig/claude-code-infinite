@@ -255,7 +255,7 @@ test("ccc's interactive HTTP hooks merge recalls at Stop and discard interrupted
   }
 });
 
-test("wrapped hooks skip missing receipts even if they arrive later", async () => {
+test("wrapped hooks skip receipts published after PostToolUse times out", async () => {
   const proxy = await startProxy({ visibleRecall: true,
     memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) });
   const hook = { ...stop, tool_use_id: randomUUID(), tool_name: "mcp__memtree__read_node" };
@@ -363,12 +363,67 @@ for (const scenario of ["teammate prompt", "late background agent", "late backgr
   });
 }
 
-test("direct PostToolUse tries a missing receipt once", async t => {
+for (const mode of ["direct", "wrapped"]) {
+  test(mode + " PostToolUse sees a receipt published after the hook starts", { timeout: 3000 }, async () => {
+    const proxy = mode === "wrapped" ? await startProxy({ visibleRecall: true,
+      memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) }) : undefined;
+    const run = async input => {
+      if (!proxy) return standaloneRecall(input);
+      const suffix = input.hook_event_name === "PostToolUse" ? "/recall" : "";
+      const res = await fetch(proxy.hookUrl + suffix, { method: "POST", body: JSON.stringify(input) });
+      return res.status === 204 ? undefined : (await res.json()).systemMessage;
+    };
+    const hook = { ...stop, tool_use_id: randomUUID(), tool_name: "mcp__memtree__read_node" };
+    let publish, release;
+    const session = new Promise(resolve => { release = resolve; });
+    try {
+      await run({ ...stop, hook_event_name: "UserPromptSubmit", prompt: "hello" });
+      await beginRecall({ ...hook, hook_event_name: "PreToolUse" }, account);
+      const text = await withRecallReceipt("read_node", hook.tool_use_id, async () => {
+        recallPassage("past", "Delayed receipt", undefined);
+        return "answer";
+      }, { account, session: () => session, afterReply: write => { publish = write; } });
+      const publication = publish();
+      setTimeout(() => release(current), 110);
+      await run({ ...hook, hook_event_name: "PostToolUse", tool_response: text });
+      const line = await run(stop);
+      await publication;
+      assert.match(line ?? "", /MemTree recalled from a past session: Delayed receipt/);
+      assert.equal(await run(stop), undefined);
+    } finally { await proxy?.drain(); }
+  });
+}
+
+test("PostToolUse follows a pending PreToolUse ticket to its receipt", { timeout: 3000 }, async t => {
+  const hook = { ...stop, tool_use_id: randomUUID(), tool_name: "mcp__memtree__read_node" };
+  // Wrapped PreToolUse can release Claude before its atomic ticket rename.
+  const rename = fs.promises.rename;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.mock.method(fs.promises, "rename", async (...args) => {
+    await gate;
+    return rename(...args);
+  });
+  const pre = beginRecall({ ...hook, hook_event_name: "PreToolUse" }, account);
+  let publish;
+  const text = await withRecallReceipt("read_node", hook.tool_use_id, async () => {
+    recallPassage("past", "Pending ticket", undefined);
+    return "answer";
+  }, { account, session: () => current, afterReply: write => { publish = write; } });
+  const post = recalled({ ...hook, hook_event_name: "PostToolUse", tool_response: text });
+  release();
+  await pre;
+  await publish();
+  assert.equal((await post)?.label, "Pending ticket");
+});
+
+test("direct PostToolUse finishes when a receipt is never published", { timeout: 1500 }, async () => {
   const input = await read("past", 4);
   await standaloneRecall({ ...input, hook_event_name: "PreToolUse" });
-  const renames = t.mock.method(fs.promises, "rename");
+  const started = performance.now();
   assert.equal(await standaloneRecall(input), undefined);
-  assert.equal(renames.mock.callCount(), 1);
+  assert.ok(performance.now() - started >= 200, "PostToolUse stopped before the publication deadline");
+  assert.equal(await standaloneRecall(stop), undefined);
 });
 
 test("repeated Stops racing after another recall cannot announce the same prompt again", async () => {

@@ -1467,7 +1467,9 @@ async function handleRequest(
           });
           if (task) {
             session.pending.push(call);
-            void task.then(() => { call.verifying = false; });
+            // Stop can follow this hook immediately. Give verification time to claim
+            // a receipt published after the tool reply, while bounding a stalled hook.
+            await waitForRecall(task.finally(() => { call.verifying = false; }));
           }
         }
       } catch { /* Optional UI; never return hook feedback to the model. */ }
