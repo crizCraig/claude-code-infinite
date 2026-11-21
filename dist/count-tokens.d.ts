@@ -117,11 +117,9 @@ export interface CountTokensSession {
     /**
      * Count `body` again, once per request, after its count ran out of time or lost its
      * connection (RETRYABLE_COUNT_OUTCOMES), with a fresh allowance for its size;
-     * an early retry with maxWaitMs shares the original allowance. Returns
-     * undefined when the failure is ineligible or that retry was spent. Each
-     * request gets one brief retry and one independent delivery retry.
+     * undefined when it did not, or the retry was spent.
      */
-    retry?(body: Buffer, maxWaitMs?: number): Promise<CountTokensResult> | undefined;
+    retry?(body: Buffer): Promise<CountTokensResult> | undefined;
 }
 /**
  * Outcomes a retry may follow: the count ran out of time or lost its connection, not
@@ -132,8 +130,8 @@ export declare const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome>;
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's
- * (countDeadlineMs), spent only while a count is in flight, so time between
- * counts (a compression before the replacement is counted) is not charged.
+ * (countDeadlineMs). Transient retries share a five-second window, including
+ * attempts and backoff. Time spent compressing between counts is not charged.
  */
 export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
 /** All failures resolve without tokens, including synchronous request errors. */

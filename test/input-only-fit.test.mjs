@@ -182,7 +182,7 @@ for (const mode of ["counted", "count-error", "count-disabled"]) {
       if (disabled) assert.notEqual(first, 200, "uncounted 3.8 MB is over its conservative bound");
       else assert.equal(first, 200);
       assert.notEqual(await h.send(3_896_000, MAX_TOKENS), 200, "near-window input not forwarded");
-      assert.equal(h.counts.length, disabled ? 0 : 2);
+      assert.equal(h.counts.length, { counted: 2, "count-error": 4, "count-disabled": 0 }[mode]);
       assert.equal(h.forwards.length, disabled ? 0 : 1);
     } finally { h.close(); }
   });

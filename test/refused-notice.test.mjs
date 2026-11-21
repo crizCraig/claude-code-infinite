@@ -83,13 +83,14 @@ test("a degraded turn whose whole history goes out still shows the degraded noti
 });
 
 test("a prefix over the window only by its uncounted bound stays the failed compress's fallback", async () => {
-  let hangNext = 0;
+  let failPlanning = false;
   let compressions = 0;
   const hasMemory = (body) => JSON.stringify(body.messages).includes("memory m");
   const h = await harness({
     // The prefix (~450 KB: ~237k by the 1.9 bytes/token bound, over the 200k
     // window) counts at 60k; the whole history at 300k.
-    count: (body) => hangNext-- > 0 ? HANG : { input_tokens: hasMemory(body) ? 60_000 : 300_000 },
+    count: (body) => failPlanning && compressions === 1 && hasMemory(body)
+      ? HANG : { input_tokens: hasMemory(body) ? 60_000 : 300_000 },
     usage: (body) => hasMemory(body) ? 60_000 : 300_000,
     compress: () => ++compressions === 1
       ? compressedReply(450_000)
@@ -102,7 +103,7 @@ test("a prefix over the window only by its uncounted bound stays the failed comp
     assert.equal(h.lastRecord().turnType, "followup-compressed");
 
     // The ride's planning count times out; delivery's retry of it answers.
-    hangNext = 1;
+    failPlanning = true;
     await h.armMainTurn("next question");
     const next = [...original, { role: "assistant", content: NEXT_ANSWER },
       { role: "user", content: "next question" }];
@@ -134,13 +135,12 @@ test("a prefix over the window only by its uncounted bound stays the failed comp
  */
 async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, compress2,
   memtreeOptions, rideCount = HANG, rideAlwaysHangs = false } = {}) {
-  let hangNext = 0;
-  let hangRides = false;
+  let failPlanning = false;
   let compressions = 0;
   const hasMemory = (body) => JSON.stringify(body.messages).includes("memory m");
   const h = await harness({
     memtreeOptions,
-    count: (body) => (hangRides && hasMemory(body)) || hangNext-- > 0
+    count: (body) => failPlanning && hasMemory(body) && (compressions === 1 || rideAlwaysHangs)
       ? rideCount
       : { input_tokens: hasMemory(body) ? 60_000 : originalTokens },
     usage: (body) => hasMemory(body) ? 60_000 : originalTokens,
@@ -149,8 +149,7 @@ async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, c
   const original = followup("x".repeat(originalChars), "first task");
   assert.equal(await h.post(original), 200);
   assert.equal(h.lastRecord().turnType, "followup-compressed");
-  hangNext = 1;
-  hangRides = rideAlwaysHangs;
+  failPlanning = true;
   await h.armMainTurn("next question");
   const next = [...original, { role: "assistant", content: NEXT_ANSWER },
     { role: "user", content: "next question" }];

@@ -48,7 +48,7 @@ import { SlowUploads } from "./slow-upload.js";
 import { type StatusLinkFiles } from "./status-link.js";
 import { type NetworkFailure } from "./network-failure.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, type CountedPrefix, type RequestCandidate } from "./request-sizing.js";
+import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
 import { PreparedCompressions } from "./prepared-compression.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
 import http from "node:http";
@@ -562,7 +562,6 @@ interface ProxyState {
      */
     serverReportsBudget: boolean;
     countTokensCooldowns: CountTokensCooldowns;
-    exactPrefixes: Map<string, CountedPrefix>;
     /**
      * Per session and model (sessionSizeKey): Anthropic's reported size of the
      * last main-thread request forwarded whole (no prefix), with its body bytes,

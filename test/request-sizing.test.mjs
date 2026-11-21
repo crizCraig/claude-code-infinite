@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bodyShape, prefixDigest } from '../dist/body-shape.js';
 import { RequestSizing, fitsMeasured } from '../dist/request-sizing.js';
 
 const limits = { budget: 100, context: 200, output: 10 };
@@ -46,7 +45,7 @@ test('low-ratio exact count is one authoritative result for plan, hint and deliv
 });
 
 for (const enabled of [true, false]) {
-  test(`only disabled counting can admit an original by its byte bound (${enabled})`, async () => {
+  test(`failed or disabled count uses final conservative byte fallback (${enabled})`, async () => {
     // No model: 2.8 bytes per token (token-estimate.ts). 500 bytes -> 179 tokens,
     // which fits 200 with 10 output; 600 bytes -> 215 does not, although
     // bytes/4 (150) used to admit it.
@@ -57,12 +56,9 @@ for (const enabled of [true, false]) {
     await sizing.measure(candidate, limits, 'plan');
     assert.ok(sizing.plan(candidate).tokens > 200, 'advisory estimate still requests compression');
     const selected = await sizing.select(candidate, limits);
-    if (enabled) assert.equal(selected, undefined);
-    else {
-      assert.equal(selected.candidate, candidate);
-      assert.equal(selected.measurement.tokens, 179);
-      assert.equal(selected.measurement.source, 'bytes');
-    }
+    assert.equal(selected.candidate, candidate);
+    assert.equal(selected.measurement.tokens, 179);
+    assert.equal(selected.measurement.source, 'bytes');
     assert.equal(counts.calls.length, enabled ? 1 : 0);
 
     const alone = new RequestSizing(fakeCounts(), enabled);
@@ -167,78 +163,4 @@ test('exactTokensFor reads a completed count for the bytes and never counts', as
   await sizing.countIfOverBound(sizing.register(Buffer.from('body'), 'replacement'),
     { budget: 1, context: 1, output: 0 });
   assert.equal(sizing.exactTokensFor(Buffer.from('body')), 150);
-});
-
-function sampledStep(prefixBytes, appendedBytes, tokens, outcome, ageMs = 0, exact = true) {
-  const model = 'claude-opus-5-5';
-  const prior = [{ role: 'user', content: 'x'.repeat(prefixBytes) }];
-  const encode = messages => Buffer.from(JSON.stringify({ model, messages }));
-  const prefix = encode(prior);
-  const sample = { tokens, forwardedBytes: prefix.length, messageCount: 1, model,
-    imageTokens: 0, imageBytes: 0, prefixDigest: prefixDigest(bodyShape(prefix), 1) };
-  let result;
-  const counted = exact ? { ...sample, at: Date.now() - ageMs, images: 0 } : undefined;
-  const sizing = new RequestSizing({ peek: () => result,
-    count: async () => result = { outcome, ms: 1 } }, true, model, counted);
-  const candidate = sizing.register(encode([...prior, { role: 'assistant', content: 'y'.repeat(appendedBytes) }]),
-    'original', sample);
-  return { sizing, candidate };
-}
-
-for (const [name, prefix, suffix, tokens] of [
-  ['a dense prefix', 1_700_000, 50_000, 986_000],
-  ['a dense 19.5% suffix', 2_000_000, 390_000, 720_000],
-]) {
-  test(`count failure cannot admit ${name} above the window`, async () => {
-    const { sizing, candidate } = sampledStep(prefix, suffix, tokens, 'server-error');
-    const limits = { budget: 100_000, context: 1_000_000, output: 0 };
-    const measured = await sizing.measure(candidate, limits);
-    assert.ok(measured.tokens >= tokens + Math.ceil(suffix * 1.05),
-      'charge the dense suffix independently with margin');
-    assert.ok(!(await sizing.select(candidate, limits)), 'overflow must decline delivery');
-  });
-}
-
-for (const outcome of ['auth', 'rate-limit', 'cooldown', 'http-error', 'invalid-response', 'invalid-request']) {
-  test(`count outcome ${outcome} uses the same exact-prefix guard`, async () => {
-    const { sizing, candidate } = sampledStep(1_700_000, 50_000, 700_000, outcome);
-    await sizing.measure(candidate, { budget: 100_000, context: 1_000_000, output: 0 });
-    assert.ok(sizing.failedCountTokens(candidate) >= 752_500);
-    assert.equal(await sizing.select(candidate, { budget: 740_000, context: 1_000_000, output: 0 }), undefined);
-  });
-}
-
-for (const [name, age, exact] of [['usage only', 0, false], ['expired exact count', 3_600_000, true]]) {
-  test(`failed count with ${name} cannot admit the original by bytes`, async () => {
-    const { sizing, candidate } = sampledStep(1_700_000, 50_000, 700_000, 'server-error', age, exact);
-    await sizing.measure(candidate, { budget: 100_000, context: 1_000_000, output: 0 });
-    assert.equal(sizing.failedCountTokens(candidate), undefined);
-    assert.equal(await sizing.select(candidate, { budget: 960_000, context: 1_000_000, output: 0 }), undefined);
-  });
-}
-
-test('an exact prefix never covers an edited message or an opaque suffix', async () => {
-  const model = 'claude-opus-5-5';
-  const frame = { model, system: 'instructions' };
-  const prefix = [{ role: 'user', content: 'unchanged history' }];
-  const encode = (messages, fields = frame) => Buffer.from(JSON.stringify({ ...fields, messages }));
-  const prior = encode(prefix);
-  let exact;
-  const first = new RequestSizing(fakeCounts(new Map([[prior.toString(), 42]])), true, model,
-    undefined, sample => { exact = sample; });
-  await first.countIfOverBound(first.register(prior, 'original'), { budget: 1, context: 1, output: 0 });
-  assert.equal(exact.tokens, 42);
-  const text = { role: 'user', content: 'next' };
-  const pdf = { type: 'document', source: { type: 'file', file_id: 'file_pdf' } };
-  const opaque = [pdf, { type: 'image', source: { type: 'url', url: 'https://example.org/image' } },
-    { type: 'tool_result', tool_use_id: 't', content: [pdf] }, { type: 'future_attachment' }];
-  const requests = [encode(prefix), encode([{ ...prefix[0], content: 'rewritten history' }, text]),
-    encode([...prefix, text], { ...frame, system: 'new instructions' }),
-    ...opaque.map(block => encode([...prefix, { role: 'user', content: [block] }]))];
-  for (const request of requests) {
-    const sizing = new RequestSizing(fakeCounts(), true, model, exact);
-    const candidate = sizing.register(request, 'original');
-    await sizing.countIfOverBound(candidate, { budget: 1, context: 1, output: 0 });
-    assert.equal(await sizing.select(candidate, { budget: 10_000, context: 20_000, output: 0 }), undefined);
-  }
 });

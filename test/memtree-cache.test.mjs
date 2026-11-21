@@ -104,10 +104,9 @@ test("concurrent fresh-proxy followup sends a newly counted hint before budget d
       await new Promise(resolve => setTimeout(resolve, 5));
     }
     release();
-    // The failed count has no verified prefix and its compression returned unchanged.
-    assert.deepEqual(await Promise.all([first, second]), [503, 200]);
+    assert.deepEqual(await Promise.all([first, second]), [200, 200]);
     assert.deepEqual(compressions.map(body => body.client_input_tokens), [undefined, 210_000]);
-    assert.equal(forwards.length, 1);
+    assert.equal(forwards.length, 2);
   } finally {
     release();
     proxy.close();

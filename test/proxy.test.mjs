@@ -9648,15 +9648,17 @@ test("a skewed size sample cannot refuse a 469,801-byte subagent request (2026-1
   }
 });
 
-test("a failed count is reused and stale usage cannot admit an unchanged compression result", async () => {
-  // MemTree returns unchanged and only the byte estimate fits the native window.
+test("a failed count is reused and native-window fallback ignores a stale learned estimate", async () => {
+  // A plausible stale sample sizes this request at ~422k; Count fails and
+  // MemTree returns unchanged. The plain bytes estimate fits the native
+  // window, so the request goes out once the transient retries are exhausted.
   const h = await edgeHarness({
     budget: 200_000,
     memtree: { noop: true },
     proxyOpts: { countTokens: true },
     upstreamOptions: {
       usageTokens: (_body, bytes) => (bytes < 20_000 ? Math.floor(bytes * 0.9) : undefined),
-      countFailures: 1,
+      countFailures: 3,
     },
   });
   try {
@@ -9667,11 +9669,11 @@ test("a failed count is reused and stale usage cannot admit an unchanged compres
     // 200k window; the 469,801 bytes this test used under bytes/4 do not.
     const rec = await h.post(sizedAgentTurn(300_000), agent);
     assert.ok(rec.compaction.estimatedTokens > 200_000, "the stale estimate is over budget");
-    assert.equal(h.upstream.countCalls.length, 1, "failed count is reused");
+    assert.equal(h.upstream.countCalls.length, 3, "exhausted count is reused");
     assert.equal(rec.countTokens[0].statusClass, "server-error");
-    assert.equal(rec.overBudgetForward, undefined);
-    assert.equal(rec.forwardedBytes, 0);
-    assert.equal(h.upstream.bodies.length, forwarded);
+    assert.equal(rec.overBudgetForward.reason, "bytes-fallback-fits-window");
+    assert.equal(rec.forwardedBytes, 300_000, "sent whole on the conservative byte bound");
+    assert.equal(h.upstream.bodies.length, forwarded + 1);
   } finally {
     h.close();
   }
@@ -9804,8 +9806,9 @@ test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses inst
 
 test("degraded notice: a planned fit that delivery sizes over the budget still warns", async () => {
   // Codex review P2: the plan can undercount (here bytes/4, with Count Tokens
-  // disabled). The notice follows delivery's own sizing: its conservative bound.
-  const h = await edgeHarness({ budget: 20_000, proxyOpts: { countTokens: false } });
+  // down). The notice follows delivery's own sizing: its conservative bound.
+  const h = await edgeHarness({ budget: 20_000, proxyOpts: { countTokens: true },
+    upstreamOptions: { countFailures: 1_000 } });
   try {
     await compactOnce(h);
     // MemTree goes down.

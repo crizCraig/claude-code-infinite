@@ -15,16 +15,6 @@ import { createHash } from "node:crypto";
  * zero tools, so ``isClaudeCodeSideRequest`` requires all three.
  */
 const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
-/** Recognize the single-line billing attribution that Claude Code updates per request. */
-export function isClaudeCodeBillingHeader(text) {
-    if (/[\r\n]/.test(text) ||
-        !text.startsWith(BILLING_HEADER_PREFIX)) {
-        return false;
-    }
-    const fields = text.slice(BILLING_HEADER_PREFIX.length).trim();
-    return (/^cc_version=[^;]+;/.test(fields) &&
-        /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields));
-}
 /** Characters of system prompt kept for auditing a suspected side request. */
 export const SYSTEM_HEAD_CHARS = 120;
 export function describeClaudeCodeRequest(body) {

@@ -1,6 +1,4 @@
 import type { ProjectMeta } from "./project-meta.js";
-/** Recognize the single-line billing attribution that Claude Code updates per request. */
-export declare function isClaudeCodeBillingHeader(text: string): boolean;
 /** Characters of system prompt kept for auditing a suspected side request. */
 export declare const SYSTEM_HEAD_CHARS = 120;
 export interface ClaudeCodeRequestInfo {

@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { gzipSync } from 'node:zlib';
 import { startProxy, fallbackBudgetTokens } from '../dist/proxy.js';
 import { MemtreeClient } from '../dist/memtree.js';
 import { AWAY_SUMMARY_PROMPT_PREFIX } from '../dist/turns.js';
@@ -25,36 +24,25 @@ async function until(condition, timeoutMs = 3_000) {
 
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
-  compressBudgetMs, longCompressBudgetMs, messageThreads, messageError, toolRouteRecovery } = {}) {
+  compressBudgetMs, longCompressBudgetMs, messageThreads } = {}) {
   const counts = [], forwards = [], compressions = [], records = [];
   const upstream = await listen((req, res) => {
     let raw = '';
     req.on('data', chunk => { raw += chunk; });
-    req.on('end', async () => {
+    req.on('end', () => {
       const body = JSON.parse(raw);
       if (req.url.includes('/count_tokens')) {
         counts.push(body);
         if (timeout) return;
         // `count` may answer HANG: that one call never answers (a timeout).
-        const result = await count(body, counts.length);
+        const result = count(body, counts.length);
         if (result === HANG) return;
         if (result === DISCONNECT) return req.socket.destroy();
-        res.writeHead(typeof countStatus === 'function' ? countStatus(counts.length) : countStatus, { 'content-type': 'application/json' });
+        const status = typeof countStatus === 'function' ? countStatus(counts.length) : countStatus;
+        res.writeHead(status, { 'content-type': 'application/json' });
         res.end(typeof result === 'string' ? result : JSON.stringify(result));
       } else {
         forwards.push(body);
-        const error = messageError?.(body, forwards.length);
-        if (error) {
-          res.writeHead(error.status, { 'content-type': error.type ?? 'application/json',
-            ...(error.gzip ? { 'content-encoding': 'gzip' } : {}) });
-          const payload = typeof error.body === 'string' ? error.body : JSON.stringify(error.body);
-          if (error.gzip) {
-            const encoded = gzipSync(payload);
-            res.write(encoded.subarray(0, 16));
-            setImmediate(() => res.end(encoded.subarray(16)));
-          } else res.end(payload);
-          return;
-        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ type: 'message', role: 'assistant',
           content: [{ type: 'text', text: 'ok' }],
@@ -86,7 +74,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     memtree,
     // budget null: no CCC_BUDGET_TOKENS, the proxy's own window-ratio fallback.
     upstreamOrigin: upstream.origin, budgetTokensOverride: budget ?? undefined, countTokens: enabled,
-    reqlog: { log: record => records.push(structuredClone(record)) }, messageThreads, toolRouteRecovery,
+    reqlog: { log: record => records.push(structuredClone(record)) }, messageThreads,
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
     session = 's', messages: suppliedMessages, model = 'claude-x', maxTokens = 64,
@@ -165,12 +153,12 @@ for (const lane of ['main', 'agent']) {
 }
 
 for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {
-  test(`stale usage and ${mode} counting: compression is required after a failure`, async () => {
+  test(`failed or disabled count ${mode}: plausible stale sample cannot refuse a fitting body`, async () => {
     const h = await harness({ enabled: mode !== 'disabled',
       usage: (_body, bytes) => bytes < 20_000 ? Math.floor(bytes * 0.9) : 100_000,
       countStatus: /^\d+$/.test(mode) ? Number(mode) : 200,
       count: () => mode === 'malformed' ? '{broken' : { input_tokens: 100_000 },
-      timeout: mode === 'timeout', compress: mode === 'disabled' ? undefined : () => compressedReply(4000, 200_000) });
+      timeout: mode === 'timeout' });
     try {
       assert.equal(await h.post(10_000), 200);
       const start = Date.now();
@@ -178,14 +166,10 @@ for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {
       // token-estimate.ts) while the stale 0.9 tokens/byte sample says 270k.
       // (469,550 bytes, the size this test used under bytes/4, no longer does.)
       assert.equal(await h.post(300_000), 200);
-      assert.ok(Date.now() - start < 4_000, 'one total 3s Count deadline');
+      assert.ok(Date.now() - start < 6_000, 'bounded Count retry window');
       assert.equal(h.forwards.length, 2);
-      assert.ok(h.counts.length <= 1, 'failed count not immediately retried');
-      if (mode === 'disabled') {
-        assert.ok(h.records.filter(r => r.kind === 'messages').at(-1).overBudgetForward);
-      } else {
-        assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
-      }
+      assert.equal(h.counts.length, { disabled: 0, 500: 3, timeout: 2 }[mode] ?? 1);
+      assert.ok(h.records.filter(r => r.kind === 'messages').at(-1).overBudgetForward);
     } finally { h.close(); }
   });
 }
@@ -599,62 +583,6 @@ test('client_input_tokens_exact is omitted for a size projected from a usage sam
   } finally { h.close(); }
 });
 
-// Round 3, request 17: a small tool step after ~796k reported tokens. Claude
-// Code's per-request billing text changes even though the history is intact.
-for (const [scenario, priorTokens, maxTokens, retryCount, expected] of [
-  ['round 3', 796_129, 128_000, undefined, 'within-limits'],
-  ['human followup', 796_129, 128_000, undefined, 'within-limits'],
-  ['window margin', 870_000, 128_000, undefined, 'over-window'],
-  ['budget margin', 955_000, 16_000, undefined, 'over-budget'],
-  ['retry counts under budget', 850_000, 128_000, 840_000, 'exact-fit'],
-  ['retry counts over budget', 796_129, 128_000, 970_000, 'exact'],
-]) {
-  test(`failed count after a small tool step: ${scenario}`, async () => {
-    const h = await harness({ budget: null, usage: () => priorTokens,
-      count: (_body, n) => n === 1 ? { input_tokens: scenario === 'round 3' ? 796_263 : priorTokens }
-        : n === 3 && retryCount ? { input_tokens: retryCount } : DISCONNECT,
-      compress: body => body.prepare ? undefined : compressedReply(4_000, 960_000) });
-    const options = { agent: '', model: 'claude-opus-5-5', maxTokens };
-    const step = (id, content) => [
-      { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: {} }] },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] }];
-    const history = [{ role: 'user', content: 'task' }, ...step('a', 'x'.repeat(2_215_000))];
-    const system = id => [{ type: 'text', text:
-      `x-anthropic-billing-header: cc_version=2.1.327; cc_entrypoint=sdk-cli; cc_turn_origin=sdk; cch=${id};` }];
-    try {
-      assert.equal(await h.post(0, { ...options, messages: history, system: system('a') }), 200);
-      assert.equal(h.compressions.filter(c => !c.prepare).length, 0);
-      const next = scenario === 'human followup' ? [...history, { role: 'assistant', content: 'done' },
-        { role: 'user', content: 'y'.repeat(6_000) }] : [...history, ...step('b', 'y'.repeat(6_000))];
-      assert.equal(await h.post(0, { ...options, messages: next, system: system('b') }), 200);
-      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
-      assert.equal(rec.compaction.budgetTokens, 960_000);
-      if (expected === 'within-limits' || expected === 'exact-fit') {
-        assert.equal(h.compressions.filter(c => !c.prepare && c.compression_target_tokens !== -1).length,
-          0, 'keep the full history');
-        assert.deepEqual(h.forwards.at(-1).messages, next);
-        assert.equal(rec.forwardedBytes, rec.requestBytes);
-        if (scenario === 'round 3') {
-          assert.ok(Math.abs(rec.compaction.countFailure.estimatedTokens - 798_362) < 100);
-        }
-      } else {
-        assert.equal(h.compressions.filter(c => !c.prepare).length, 1);
-        assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
-      }
-      assert.deepEqual(rec.countTokens.slice(0, 2).map(c => c.statusClass),
-        ['network-error', retryCount ? 'success' : 'network-error']);
-      assert.ok(rec.countTokens[1].timeoutMs <= 1_000);
-      if (retryCount) {
-        assert.equal(rec.compaction.estimatedTokens, retryCount);
-        assert.equal(rec.compaction.countFailure, undefined);
-      } else {
-        assert.equal(rec.compaction.countFailure.decision, expected);
-        assert.ok(rec.compaction.estimatedTokens > rec.compaction.countFailure.estimatedTokens);
-      }
-    } finally { h.close(); }
-  });
-}
-
 // Codex round 2, finding 1: a projected usage sample cannot hide a body whose
 // conservative bound is over the window when the body cannot be counted.
 for (const mode of ['disabled', 'timeout']) {
@@ -924,6 +852,51 @@ const toolRound = (id, chars) => [
 const nearWindowTurn = () => [{ role: 'user', content: 'task' }, ...toolRound('t1', 3_520_000)];
 const quarterToken = body => ({ input_tokens: Math.floor(JSON.stringify(body).length / 4) });
 
+// Round 3, request 17: the billing header changed after a ~796k tool turn.
+for (const [scenario, outcomes] of [
+  ['retry fits', ['network-error', 'success']],
+  ['all disconnected', ['network-error', 'network-error', 'network-error']],
+  ['HTTP 400', ['http-error']],
+  ['delivery retry', ['network-error', 'network-error', 'network-error', 'success']],
+]) {
+  test(`round 3 count failure: ${scenario}`, async () => {
+    const h = await harness({ budget: null, usage: () => 796_129,
+      countStatus: n => outcomes[n - 2] === 'http-error' ? 400 : 200,
+      count: (_body, n) => {
+        if (n === 1) return { input_tokens: 796_263 };
+        if (outcomes[n - 2] === 'http-error') return { error: 'invalid request' };
+        if (outcomes[n - 2] === 'success') return { input_tokens: 798_362 };
+        return DISCONNECT;
+      },
+      compress: () => scenario === 'delivery retry'
+        ? { status: 503, body: { detail: 'MemTree unavailable' } } : compressedReply(4000, 960_000) });
+    const first = [{ role: 'user', content: 'task' }, ...toolRound('a', 2_215_000)];
+    const next = [...first, ...toolRound('b', 6_000)];
+    const system = id => [{ type: 'text', text:
+      `x-anthropic-billing-header: cc_version=2.1.327; cc_entrypoint=sdk-cli; cc_turn_origin=sdk; cch=${id};` }];
+    try {
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: first, system: system('a') }), 200);
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: next, system: system('b') }), 200);
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      const attempts = rec.countTokens.map(c => c.statusClass);
+      assert.equal(rec.compaction.budgetTokens, 960_000);
+      assert.deepEqual(attempts, outcomes);
+      const blocking = h.compressions.filter(c => !c.prepare && c.compression_target_tokens !== -1);
+      if (outcomes.at(-1) === 'success') {
+        assert.deepEqual(h.forwards.at(-1).messages, next);
+        assert.equal(rec.forwardedBytes, rec.requestBytes);
+        if (scenario === 'retry fits') {
+          assert.equal(rec.compaction.estimatedTokens, 798_362);
+          assert.equal(blocking.length, 0);
+        }
+      } else {
+        assert.equal(blocking.length, 1);
+        assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+      }
+    } finally { h.close(); }
+  });
+}
+
 for (const outcome of ['compressed', 'failed']) {
   test(`960k budget: a tool round jumping from 880k past the 1M window is compressed mid-turn (${outcome})`, async () => {
     let failing = outcome === 'failed';
@@ -1009,140 +982,4 @@ test('the fallback budget mirrors the server: every Claude model near its window
   for (const model of ['claude-x', 'gpt-6', undefined]) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), 800_000, String(model));
   }
-});
-
-const billing = id => [{ type: 'text', text:
-  `x-anthropic-billing-header: cc_version=2.1.327; cc_entrypoint=sdk-cli; cc_turn_origin=sdk; cch=${id};` }];
-
-async function postSampleAndStep(h, prefixBytes, appendedBytes) {
-  const messages = [{ role: 'user', content: 'task' }, ...toolRound('first', prefixBytes)];
-  assert.equal(await h.post(0, { ...OPUS_1M, messages, system: billing('a') }), 200);
-  return h.post(0, { ...OPUS_1M, messages: [...messages, ...toolRound('next', appendedBytes)],
-    system: billing('b') });
-}
-
-for (const status of [400, 401, 413, 422, 429, 503]) {
-  test(`count HTTP ${status} permits a verified fitting suffix regardless of error text`, async () => {
-    const h = await harness({ budget: 960_000, usage: () => 796_129,
-      countStatus: n => n === 1 ? 200 : status,
-      count: (_body, n) => n === 1 ? { input_tokens: 796_129 } : { error: { message: 'prompt is too long' } },
-      compress: () => compressedReply(4000, 960_000) });
-    try {
-      assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
-      assert.equal(h.forwards.at(-1).messages.length, 5);
-      assert.equal(h.compressions.filter(c => !c.prepare).length, 0);
-    } finally { h.close(); }
-  });
-}
-
-for (const [name, status, message, retry, sse] of [
-  ['prompt', 400, 'prompt is too long', true],
-  ['delivery only', 400, 'input length and max_tokens exceed context limit', true],
-  ['combined context', 400, 'input length and max_tokens exceed context limit', true],
-  ['Claude Code spelling', 400, 'input length and `max_tokens` exceed context limit: 990000 + 128000 > 1000000', true],
-  ['SSE error behind a ping', 200, 'prompt is too long', true, true],
-  ['compressed SSE error', 200, 'prompt is too long', true, true],
-  ['repeat overflow', 400, 'maximum context length exceeded', true],
-  ['429', 429, 'input token limit exceeded for tokens per minute', false],
-  ['quota', 400, 'input token limit exceeded for tokens per minute', false],
-]) {
-  test(`Messages rejection after failed count: ${name}`, async () => {
-    const h = await harness({ budget: 960_000, usage: () => 796_129, toolRouteRecovery: name !== 'delivery only',
-      count: (_body, n) => n === 1 ? { input_tokens: 796_129 } : DISCONNECT,
-      messageError: (_body, n) => {
-        if (n !== 2 && !(n === 3 && name === 'repeat overflow')) return;
-        const error = { type: 'error', error: { type: name === 'quota' ? 'rate_limit_error' : 'invalid_request_error', message } };
-        return sse ? { status, type: 'text/event-stream', gzip: name === 'compressed SSE error',
-          body: ': heartbeat\n\nevent: error\ndata: ' + JSON.stringify(error) + '\n\n' }
-          : { status, body: error };
-      }, compress: () => compressedReply(4000, 960_000) });
-    try {
-      const response = await postSampleAndStep(h, 2_215_000, 6_000);
-      assert.equal(response, retry && name !== 'repeat overflow' ? 200 : status);
-      assert.equal(h.forwards.length, retry ? 3 : 2);
-      assert.equal(h.compressions.filter(c => !c.prepare).length, retry ? 1 : 0);
-      if (retry) assert.match(JSON.stringify(h.forwards[2].messages), /memory m/);
-      else {
-        const messages = [{ role: 'user', content: 'task' }, ...toolRound('first', 2_215_000),
-          ...toolRound('next', 6_000)];
-        assert.equal(await h.post(0, { ...OPUS_1M, messages, system: billing('b') }), 200);
-        assert.deepEqual(h.forwards.at(-1).messages, messages);
-      }
-    } finally { h.close(); }
-  });
-}
-
-test('a regenerated billing header rides the replacement installed after Messages overflow', async () => {
-  const messages = [{ role: 'user', content: 'task' }, ...toolRound('first', 2_215_000),
-    ...toolRound('next', 6_000)];
-  const h = await harness({ budget: 960_000, usage: () => 796_129,
-    count: (_body, n) => n === 1 ? { input_tokens: 796_263 } : DISCONNECT,
-    messageError: body => body.messages.length === messages.length ? { status: 400,
-      body: { error: { message: 'prompt is too long' } } } : undefined,
-    compress: () => compressedReply(4000, 960_000) });
-  try {
-    assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
-    assert.equal(await h.post(0, { ...OPUS_1M, messages, system: billing('regenerated') }), 200);
-    assert.equal(h.forwards.filter(body => body.messages.length === messages.length).length, 1);
-    assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
-  } finally { h.close(); }
-});
-
-test('delivery logs a fitting guarded suffix when tool planning is disabled', async () => {
-  const h = await harness({ toolRouteRecovery: false, budget: 960_000, usage: () => 796_129,
-    count: (_body, n) => n === 1 ? { input_tokens: 796_129 } : DISCONNECT });
-  try {
-    assert.equal(await postSampleAndStep(h, 2_215_000, 6000), 200);
-    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
-    assert.equal(rec.countFailure.decision, 'within-limits');
-    assert.equal(rec.forwardedBytes, rec.requestBytes);
-  } finally { h.close(); }
-});
-
-test('a new file-backed PDF cannot use a fitting byte estimate after Count Tokens fails', async () => {
-  const h = await harness({ budget: 100_000, count: () => ({ error: 'unsupported file' }),
-    countStatus: 400, compress: () => compressedReply(4000) });
-  const messages = [{ role: 'user', content: 'task' }, { role: 'assistant', content: 'x'.repeat(170_000) },
-    { role: 'user', content: [{ type: 'document', source: { type: 'file', file_id: 'file_pdf' } }] }];
-  try {
-    assert.equal(await h.post(0, { messages }), 200);
-    assert.ok(h.counts.length);
-    assert.equal(h.compressions.filter(c => !c.prepare).length, 1);
-    assert.match(JSON.stringify(h.forwards[0].messages), /memory m/);
-  } finally { h.close(); }
-});
-
-test('guarded size at the soft budget triggers compression and logs over-budget', async () => {
-  async function run(budget) {
-    const h = await harness({ budget, usage: () => 796_129,
-      count: (_body, n) => n === 1 ? { input_tokens: 796_129 } : DISCONNECT,
-      compress: () => compressedReply(4000, budget) });
-    try {
-      assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
-      return { decision: h.records.filter(r => r.kind === 'messages').at(-1).compaction.countFailure,
-        blocking: h.compressions.filter(c => !c.prepare && c.compression_target_tokens !== -1).length };
-    } finally { h.close(); }
-  }
-  const first = await run(960_000);
-  const equal = await run(first.decision.guardedTokens);
-  assert.equal(equal.decision.guardedTokens, first.decision.guardedTokens);
-  assert.equal(equal.decision.decision, 'over-budget');
-  assert.equal(equal.blocking, 1);
-});
-
-test('delivery still counts a fitting request after planning exhausts its brief retry', async () => {
-  const tokens = 870_000;
-  const h = await harness({ budget: 960_000, usage: () => tokens, count: async (_body, n) => {
-    if (n === 2) return DISCONNECT;
-    if (n >= 3) await new Promise(resolve => setTimeout(resolve, 1250));
-    return { input_tokens: tokens };
-  }, compress: () => ({ status: 503, body: { detail: 'MemTree unavailable' } }) });
-  try {
-    assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
-    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
-    assert.deepEqual(rec.countTokens.map(c => c.statusClass), ['network-error', 'timeout', 'success']);
-    assert.ok(rec.countTokens[1].timeoutMs <= 1000);
-    assert.ok(rec.countTokens[2].timeoutMs > 1250);
-    assert.equal(rec.requestBytes, rec.forwardedBytes);
-  } finally { h.close(); }
 });

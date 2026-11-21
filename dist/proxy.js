@@ -50,7 +50,7 @@ import { SlowUploads } from "./slow-upload.js";
 import { readStatusLink } from "./status-link.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
-import { RequestSizing, estimateLimits, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
+import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
 import { extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions, prepareStartTokens } from "./prepared-compression.js";
 import { truncateToolResults } from "./tool-result-truncation.js";
@@ -58,7 +58,6 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
-import { Readable } from "node:stream";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -72,7 +71,7 @@ import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js"
 import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeBillingHeader as isRouteBillingHeader, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
@@ -428,7 +427,6 @@ export function startProxy(opts) {
         serverBudgets: new Map(),
         serverReportsBudget: false,
         countTokensCooldowns: new CountTokensCooldowns(),
-        exactPrefixes: new Map(),
         passthroughSizes: new Map(),
         laneSizes: new Map(),
     };
@@ -1482,8 +1480,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
         },
     }, state.countTokensCooldowns);
-    const keepExact = requestSessionKey !== undefined && !notConversation;
-    const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined, keepExact ? state.exactPrefixes.get(requestSizeKey) : undefined, keepExact ? prefix => boundedSet(state.exactPrefixes, requestSizeKey, prefix) : undefined);
+    const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined);
     if (carriesServerTools(body))
         serverToolRecords.add(rec);
     const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey, body.model);
@@ -1558,27 +1555,6 @@ async function handleMessages(req, res, opts, upstream, state) {
         failedRebuild: false,
         allowed: new WeakSet(),
         sizing: requestSizing,
-        recoverOverflow: async () => {
-            if (rec.lateCountRecovery || state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight)
-                return;
-            const policy = requestSendPolicies.get(req);
-            rec.lateCountRecovery = { outcome: "refused" };
-            const replacement = await holdingLane(state, requestRouteKey, () => policy.recoverLate(modelContextLimit, undefined, true));
-            if (!replacement)
-                return;
-            const candidate = requestSizing.register(replacement, "replacement");
-            const limits = sizingLimits();
-            if (candidate.kind !== "replacement" || !fitsMeasured(await requestSizing.measure(candidate, limits), limits)) {
-                lateRouteInstalls.get(rec)?.settle(false);
-                lateRouteInstalls.delete(rec);
-                return;
-            }
-            selectedCandidates.set(rec, candidate);
-            changedDeliveryRecords.add(rec);
-            recordTurn(rec, rec.turnType, candidate.body);
-            rec.lateCountRecovery.outcome = "compressed";
-            return candidate.body;
-        },
         select: (buffer) => selectForwardCandidate({
             opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
             preferredBody: buffer, limits: sizingLimits(),
@@ -1592,12 +1568,12 @@ async function handleMessages(req, res, opts, upstream, state) {
         },
         // The ride's bytes are only what failed; recovery always compresses the
         // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
-        recoverLate: async (rideTokens, target, upstreamRejected = false) => {
+        recoverLate: async (_ride, rideTokens, target) => {
             // A compression already made may be redone only to a smaller target.
-            if (notConversation || (!upstreamRejected && rec.compress && target === undefined) ||
+            if (notConversation || (rec.compress && target === undefined) ||
                 compactionMode(opts, state, requestSessionKey, requestRouteLane).mode === "off" ||
                 !hasEarlierNonToolUserMessage(messages) ||
-                (!upstreamRejected && rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
+                (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
                 return undefined;
             return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
                 modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
@@ -3450,7 +3426,8 @@ function uncountedOnlyOverWindow(record, body, modelContextLimit) {
         (record.estimatedTokens ?? 0) + bodyOutputReservation(body, false) <= modelContextLimit;
 }
 function calibratedSizeExceedsLimits(record, body, modelContextLimit) {
-    return (record.sizeSource === "reported" && reachedBudget(record)) ||
+    return (record.sizeSource === "reported" &&
+        (record.estimatedTokens ?? 0) >= record.budgetTokens) ||
         calibratedSizeExceedsWindow(record, body, modelContextLimit);
 }
 /** Only calibrated usage may force an estimate-driven compaction. */
@@ -3533,7 +3510,8 @@ function sizeSampleOf(sent, tokens, model) {
 function sampleLineage(sent, model) {
     const shape = bodyShape(sent);
     const digest = shape && prefixDigest(shape, shape.messages.length);
-    return shape && digest && model ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
+    return shape && digest && model
+        ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
 }
 /**
  * Anthropic's input tokens for the body this request forwarded, when its usage
@@ -3690,7 +3668,7 @@ async function planEdgeCompaction(args) {
             (explicitTarget && prefix.targetTokens !== targetTokens)) {
             return forced("target-change", fallback);
         }
-        if (reachedBudget(compaction) || overWindow) {
+        if (size.tokens >= budget.tokens || overWindow) {
             const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
                 waitMs: opts.memtree.longCompressBudgetMs });
             if (adopted)
@@ -3731,13 +3709,11 @@ async function planEdgeCompaction(args) {
     }
     if (state.serverReportsBudget) {
         // The server measures the request and compresses only past the budget.
-        compaction.thresholdTokens = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
-    }
-    if (clearlyUnderBudget(opts, state, budget, size, compaction))
-        return { kind: "pass" };
-    if (compaction.thresholdTokens !== undefined) {
-        return { kind: "compress", target: targetTokens, threshold: compaction.thresholdTokens,
-            targetTokens, explicitTarget };
+        const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
+        compaction.thresholdTokens = threshold;
+        if (clearlyUnderBudget(opts, state, budget, size, compaction))
+            return { kind: "pass" };
+        return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
     }
     // Without calibrated usage or threshold support, let the server decide
     // against its own model budget rather than forcing from transport bytes.
@@ -3812,7 +3788,7 @@ async function planToolCompaction(args) {
             return { kind: "pass", original: true };
         return ride ? { kind: "ride", ride } : { kind: "pass" };
     }
-    const underBudget = !reachedBudget(compaction) && !overWindow;
+    const underBudget = size.tokens < budget.tokens && !overWindow;
     const cold = underBudget && coldCacheCompress(state, rec, size, targetTokens);
     if (underBudget && !cold) {
         return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3872,9 +3848,7 @@ function clearlyUnderBudget(opts, state, budget, size, compaction) {
     // A known payment or key failure keeps the blocking path: it gives the notice.
     if (opts.memtree.paymentRequiredDetail !== null || state.keyInvalid())
         return false;
-    if (compaction.countFailure?.decision === "within-limits")
-        return true;
-    return state.serverReportsBudget && budget.source !== "window-ratio" && size.source === "reported" &&
+    return budget.source !== "window-ratio" && size.source === "reported" &&
         compaction.uncountedOverWindow !== true &&
         size.tokens <= Math.floor(budget.tokens * CLEARLY_UNDER_BUDGET_RATIO);
 }
@@ -4348,22 +4322,10 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
         exactSizedRecords.add(record);
         return;
     }
-    const limits = { budget: record.budgetTokens, context: modelContextLimit,
-        output: bodyOutputReservation(body, false) };
-    const failure = countFailureDecision(sizing, candidate, limits);
-    if (failure)
-        record.countFailure = failure;
-    if (!sizing.boundFits(candidate, limits) && failure?.decision !== "over-budget") {
+    if (sizing.exceedsRequestLimit(candidate) ||
+        candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
         record.uncountedOverWindow = true;
     }
-}
-function countFailureDecision(sizing, candidate, limits) {
-    const guarded = sizing.failedCountTokens(candidate);
-    if (guarded === undefined)
-        return undefined;
-    return { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
-        decision: !fitsNative(guarded, estimateLimits(limits)) ? "over-window"
-            : guarded >= limits.budget ? "over-budget" : "within-limits" };
 }
 /**
  * Whether a forwarded compressed body still overflows the window: its exact
@@ -4386,8 +4348,7 @@ function bodyOutputReservation(body, exact = true) {
 /** A planned size as a measurement, exact only when Count Tokens measured it. */
 function plannedMeasurement(sizing, candidate) {
     const planned = sizing.plan(candidate);
-    return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source,
-        ...(sizing.exceedsRequestLimit(candidate) ? { tooLarge: true } : {}) };
+    return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source };
 }
 function regrantSmallerWindowRecovery(state, key, modelContextLimit) {
     const previous = state.toolRecoveryAttemptedLanes.get(key);
@@ -4448,6 +4409,7 @@ function normalizeReminderContent(content) {
         return copy;
     });
 }
+const ROUTE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const ROUTE_BILLING_HEADER_PLACEHOLDER = "x-anthropic-billing-header: <dynamic>";
 function normalizeRouteText(text) {
     return stripSystemReminderText(text);
@@ -4495,6 +4457,15 @@ function routeBillingHeaders(value) {
         }
     }
     return headers;
+}
+function isRouteBillingHeader(text) {
+    if (/[\r\n]/.test(text) ||
+        !text.startsWith(ROUTE_BILLING_HEADER_PREFIX)) {
+        return false;
+    }
+    const fields = text.slice(ROUTE_BILLING_HEADER_PREFIX.length).trim();
+    return (/^cc_version=[^;]+;/.test(fields) &&
+        /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields));
 }
 function replaceSingleRouteBillingHeader(value, replacement) {
     if (typeof value === "string") {
@@ -5674,16 +5645,11 @@ async function selectForwardCandidate(args) {
         ? policy.original : args.preferredBody;
     const preferred = policy.sizing.register(intended, policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
     const measured = await policy.sizing.measure(preferred, args.limits);
-    if (!args.rec.compaction?.countFailure) {
-        const failure = countFailureDecision(policy.sizing, preferred, args.limits);
-        if (failure)
-            args.rec.countFailure = failure;
-    }
     let target = preferred;
     const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits, args.routeKey);
     if (late) {
         args.rec.lateCountRecovery = { outcome: "forwarded" };
-        const replacement = await holdingLane(args.state, args.routeKey, () => policy.recoverLate(late.tokens, late.target));
+        const replacement = await holdingLane(args.state, args.routeKey, () => policy.recoverLate(preferred.body, late.tokens, late.target));
         if (replacement)
             target = policy.sizing.register(replacement, "replacement");
     }
@@ -5745,10 +5711,7 @@ async function selectForwardCandidate(args) {
     else if (degraded) {
         delete args.rec.degradedNotice;
     }
-    const selected = changed ? candidate.body : intended;
-    if (policy.sizing.failedCountTokens(candidate) !== undefined)
-        policy.guardedBody = selected;
-    return selected;
+    return changed ? candidate.body : intended;
 }
 /** MemTree's answer when the conversation cannot fit the window even compressed. */
 const OVER_CONTEXT_STATUS = 413;
@@ -5849,8 +5812,7 @@ function lateRecoveryPlan(state, rec, preferred, measured, limits, routeKey) {
         const target = Math.floor(oversized.target - excess - oversized.target * SMALLER_TARGET_MARGIN);
         return target >= SERVER_MIN_TARGET_TOKENS ? { tokens: oversized.tokens, target } : undefined;
     }
-    const countedOverBudget = measured.source === "exact" && measured.tokens > limits.budget;
-    if (rec.compress || (!countedOverBudget && !measured.tooLarge)) {
+    if (rec.compress || measured.source !== "exact" || !(measured.tokens > limits.budget)) {
         return undefined;
     }
     // Another request of this lane is compressing (rec.routeRecovery "in-flight"):
@@ -6239,9 +6201,7 @@ function nearWindowWarned(state, sessionId) {
 }
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction) {
-    if (compaction?.estimatedTokens === undefined)
-        return false;
-    return compaction.estimatedTokens >= compaction.budgetTokens;
+    return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
 }
 /**
  * Whether the planned size says a turn needed MemTree to compress it: a
@@ -6258,7 +6218,7 @@ function compressionNeeded(compaction) {
         return true;
     if (compaction.estimatedTokens === undefined)
         return true;
-    return reachedBudget(compaction);
+    return compaction.estimatedTokens >= compaction.budgetTokens;
 }
 /**
  * A degraded turn's notice, queued by delivery only when the whole request
@@ -6285,27 +6245,10 @@ async function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, 
     const lateInstall = rec && selected !== bodyBuffer ? lateRouteInstalls.get(rec) : undefined;
     if (rec)
         lateRouteInstalls.delete(rec);
-    const recover = policy?.guardedBody === selected ? policy.recoverOverflow : undefined;
-    const first = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate, recover);
-    let delivered = first === true;
+    const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate);
     lateInstall?.settle(delivered, selected);
-    if (Buffer.isBuffer(first) && rec) {
-        const install = lateRouteInstalls.get(rec);
-        lateRouteInstalls.delete(rec);
-        try {
-            if (!res.destroyed && !shutdownSignal.aborted) {
-                delivered = await forwardAccepted(req, res, first, opts, upstream, shutdownSignal, rec, install?.activate) === true;
-            }
-        }
-        finally {
-            install?.settle(delivered, first);
-        }
-    }
-    if (delivered) {
-        policy?.delivered();
-        if (rec)
-            noteSelectedCandidateSize(rec);
-    }
+    if (delivered && rec)
+        noteSelectedCandidateSize(rec);
     return delivered;
 }
 /** Attribute a fallback response only to the body and size owner actually sent. */
@@ -6327,9 +6270,9 @@ function noteSelectedCandidateSize(rec) {
         owner.lastSize = sample;
     }
 }
-/** Forward one attempt. A verified replacement returns to forwardRaw before the
- * rejected response commits headers, so the caller can send it once. */
-function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete, recoverOverflow) {
+/** forwardRaw once the request's send policy (if any) accepted the body. */
+function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
+    const policy = requestSendPolicies.get(req);
     return new Promise((resolve) => {
         const headers = forwardableRequestHeaders(req);
         headers["content-length"] = String(bodyBuffer.length);
@@ -6369,14 +6312,16 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                 // Route/observer bookkeeping can never affect byte delivery.
             }
         };
-        const settle = (result) => {
+        const settle = (ok) => {
             if (settled)
                 return;
             settled = true;
+            if (ok)
+                policy?.delivered();
             res.off("finish", onResponseFinish);
             res.off("close", onResponseClose);
             shutdownSignal.removeEventListener("abort", cancelForShutdown);
-            resolve(result);
+            resolve(ok);
         };
         const maybeSettle = () => {
             if (upstreamCompleted && responseFinished) {
@@ -6450,41 +6395,13 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             method: req.method,
             path: req.url, // path + query string verbatim (?beta=true etc.)
             headers,
-        }, async (upstreamRes) => {
+        }, (upstreamRes) => {
             upstream.unreachable = undefined;
             activeUpstreamRes = upstreamRes;
             const contentType = String(upstreamRes.headers["content-type"] ?? "");
             const isSse = contentType.includes("text/event-stream");
             const contentEncoding = String(upstreamRes.headers["content-encoding"] ?? "identity").trim().toLowerCase();
             const compressed = contentEncoding !== "" && contentEncoding !== "identity";
-            let responseBody = upstreamRes;
-            if (recoverOverflow && rec && !res.headersSent) {
-                try {
-                    const inspected = await inspectMessagesResponse(upstreamRes, isSse, contentEncoding);
-                    responseBody = inspected.stream;
-                    if (inspected.overflow && !settled) {
-                        const replacement = await recoverOverflow();
-                        if (replacement) {
-                            if (settled) {
-                                lateRouteInstalls.get(rec)?.settle(false);
-                                lateRouteInstalls.delete(rec);
-                            }
-                            else {
-                                settle(replacement);
-                            }
-                            upstreamRes.destroy();
-                            return;
-                        }
-                    }
-                    if (settled)
-                        return;
-                }
-                catch {
-                    res.destroy();
-                    settle(false);
-                    return;
-                }
-            }
             let sawFirstByte = false;
             let sawMessageStop = false;
             let observerFailed = false;
@@ -6569,13 +6486,13 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         return false;
                     }
                     if (res.write(chunk))
-                        responseBody.resume();
+                        upstreamRes.resume();
                     else
-                        res.once("drain", () => responseBody.resume());
+                        res.once("drain", () => upstreamRes.resume());
                     return true;
                 };
-                responseBody.on("data", (chunk) => {
-                    responseBody.pause();
+                upstreamRes.on("data", (chunk) => {
+                    upstreamRes.pause();
                     observeRawChunk(chunk);
                     if (decoderFailed) {
                         forwardEncoded(chunk);
@@ -6615,7 +6532,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         forwardOnce();
                     }
                 });
-                responseBody.on("end", () => {
+                upstreamRes.on("end", () => {
                     let finished = false;
                     const finish = () => {
                         if (finished)
@@ -6639,12 +6556,12 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         finish();
                     }
                 });
-                responseBody.on("error", () => {
+                upstreamRes.on("error", () => {
                     incrementalDecoder.destroy();
                     res.destroy();
                     settle(false);
                 });
-                responseBody.on("aborted", () => {
+                upstreamRes.on("aborted", () => {
                     incrementalDecoder.destroy();
                     res.destroy();
                     settle(false);
@@ -6655,7 +6572,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                 // Same observation as below, but the client gets the rewriter's
                 // output (original frames plus the appended block) instead of the
                 // raw bytes. Backpressure mirrors pipe().
-                responseBody.on("data", (chunk) => {
+                upstreamRes.on("data", (chunk) => {
                     if (rec && !sawFirstByte) {
                         sawFirstByte = true;
                         rec.ttfbMs = Date.now() - forwardStarted;
@@ -6664,14 +6581,14 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                     if (!out || res.destroyed || res.writableEnded)
                         return;
                     if (!res.write(out)) {
-                        responseBody.pause();
-                        res.once("drain", () => responseBody.resume());
+                        upstreamRes.pause();
+                        res.once("drain", () => upstreamRes.resume());
                     }
                     if (sawMessageStop && !observerFailed && !res.destroyed) {
                         notifyProtocolComplete();
                     }
                 });
-                responseBody.on("end", () => {
+                upstreamRes.on("end", () => {
                     const rest = sseObserver.flush();
                     if (rest && !res.destroyed && !res.writableEnded)
                         res.write(rest);
@@ -6679,30 +6596,30 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         res.end();
                     completeUpstream(!observerFailed && sawMessageStop);
                 });
-                responseBody.on("error", () => {
+                upstreamRes.on("error", () => {
                     res.destroy();
                     settle(false);
                 });
-                responseBody.on("aborted", () => {
+                upstreamRes.on("aborted", () => {
                     res.destroy();
                     settle(false);
                 });
                 return;
             }
-            responseBody.on("data", observeRawChunk);
-            responseBody.pipe(res);
+            upstreamRes.on("data", observeRawChunk);
+            upstreamRes.pipe(res);
             if (isSse && !compressed) {
                 // Registered after pipe(), so this runs only after the raw chunk
                 // containing the complete message_stop frame has been accepted by
                 // ServerResponse. The callback still runs synchronously before a
                 // client can issue the resulting tool request.
-                responseBody.on("data", () => {
+                upstreamRes.on("data", () => {
                     if (sawMessageStop && !observerFailed && !res.destroyed) {
                         notifyProtocolComplete();
                     }
                 });
             }
-            responseBody.on("end", () => {
+            upstreamRes.on("end", () => {
                 let observed = null;
                 if (observedChunks) {
                     observed = decodeForObservation(Buffer.concat(observedChunks), contentEncoding);
@@ -6727,100 +6644,23 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                     completeUpstream(observed !== null && isCompleteJsonResponse(req.url, observed));
                 }
             });
-            responseBody.on("error", () => {
+            upstreamRes.on("error", () => {
                 res.destroy();
                 settle(false);
             });
-            responseBody.on("aborted", () => {
+            upstreamRes.on("aborted", () => {
                 res.destroy();
                 settle(false);
             });
         });
         upstreamReq.on("error", (err) => {
-            if (!settled && !shutdownCancelled) {
+            if (!shutdownCancelled) {
                 sendAnthropicError(res, upstreamFailureMessage(upstream, err, !activeUpstreamRes));
             }
             settle(false);
         });
         upstreamReq.end(bodyBuffer);
     });
-}
-/** Inspect only the response to a guarded send. Keep the wire bytes so an unrelated
- * error can pass through verbatim. Once SSE starts producing content, stream normally. */
-async function inspectMessagesResponse(response, sse, encoding) {
-    const status = response.statusCode ?? 502;
-    if (status === 429 || status === 402)
-        return { overflow: false, stream: response };
-    if (!sse) {
-        const raw = await readAll(response);
-        const decoded = decodeForObservation(raw, encoding);
-        const overflow = messagesOverflow(status, decoded?.toString("utf8") ?? "");
-        return { overflow, stream: Readable.from([raw]) };
-    }
-    const chunks = [];
-    const iterator = response[Symbol.asyncIterator]();
-    let overflow = false;
-    let decided = false;
-    const events = new SseNoticeRewriter({ onEvent: data => {
-            if (data?.type === "error") {
-                overflow = messagesOverflow(status, data);
-                decided = true;
-            }
-            else if (data?.type === "content_block_delta" || data?.type === "message_stop") {
-                decided = true;
-            }
-        } });
-    const decoder = createObservationDecoder(encoding);
-    decoder?.on("data", chunk => events.push(chunk));
-    decoder?.on("error", () => { decided = true; });
-    try {
-        while (!decided) {
-            const next = await iterator.next();
-            if (next.done)
-                break;
-            const raw = next.value;
-            chunks.push(raw);
-            if (decoder)
-                await new Promise(resolve => decoder.write(raw, () => resolve()));
-            else
-                events.push(raw);
-        }
-    }
-    finally {
-        decoder?.destroy();
-    }
-    return { overflow, stream: Readable.from((async function* () {
-            yield* chunks;
-            yield* { [Symbol.asyncIterator]: () => iterator };
-        })()) };
-}
-/** Only a Messages rejection can trigger a compressed retry. A quota may mention a
- * token limit in exactly the same words as a context error. */
-function messagesOverflow(status, payload) {
-    if (status === 429)
-        return false;
-    if (typeof payload === "string") {
-        try {
-            payload = JSON.parse(payload);
-        }
-        catch { /* Plain-text gateway error. */ }
-    }
-    const envelope = payload;
-    if (status < 400 && envelope?.type !== "error" && !envelope?.error)
-        return false;
-    const error = envelope?.error ?? payload;
-    const fields = error;
-    const detail = (typeof error === "string" ? error :
-        [fields?.type, fields?.code, fields?.message, fields?.detail].join(" "))
-        .toLowerCase().replace(/`/g, "").replace(/[_-]/g, " ");
-    if (envelope?.status === 429 || fields?.status === 429 || /quota|rate limit|usage limit|billing error|credit balance|too many requests/.test(detail) ||
-        /(?:per |\/)(?:minute|second|hour|day)|\b(?:[io]?tpm|rpm)\b/.test(detail))
-        return false;
-    return status === 413 || /(?:prompt|input|request|payload|body)(?: length| size)? (?:is )?too (?:long|large)/.test(detail) ||
-        /input length and max tokens exceed context limit|maximum context length|context (?:length|window|limit) exceeded/.test(detail) ||
-        /exceeds? (?:the )?(?:max(?:imum)? |allowed )*(?:context (?:length|window|limit)|number of tokens|input length)/.test(detail) ||
-        /(?:prompt|input|request|payload)(?: length| size)? exceeds (?:the )?(?:maximum|max|limit)/.test(detail) ||
-        /token (?:count|limit) exceeded|too many (?:input |prompt )?tokens/.test(detail);
 }
 function isCompleteJsonResponse(requestUrl, body) {
     try {

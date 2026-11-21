@@ -3,10 +3,6 @@ export declare const SHAPE_MIN_BYTES: number;
 export interface BodyShape {
     /** Hash of the body without `messages` (system, tools, thinking, ...). */
     frame: string;
-    /** Same frame with the per-request billing text removed. Only the failed-count
-     * fallback uses it and charges the current billing text in full. */
-    billingFrame?: string;
-    billingBytes?: number;
     /** One hash per message, in order. */
     messages: string[];
     /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
@@ -33,9 +29,6 @@ export interface BodyShape {
      * Anthropic counted expanded; one appended disables the anchor.
      */
     lastExpanding: number;
-    /** Last message with content that cannot be sized from its bytes or image dimensions. */
-    lastUnsized: number;
-    frameAnchorable: boolean;
     /**
      * Canonical bytes of the frame fields left out of the hash because Claude Code rewrites
      * them every turn (UNHASHED_FIELDS): an anchored bound charges them in full each time, on
@@ -44,13 +37,13 @@ export interface BodyShape {
     unhashedBytes: number;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
-export declare function bodyShape(body: Buffer, includeSmall?: boolean): BodyShape | undefined;
+export declare function bodyShape(body: Buffer): BodyShape | undefined;
 /** The shape already worked out for `body`, if any; never computes one. */
 export declare function knownShape(body: Buffer): BodyShape | undefined;
 /** Remember `shape` for another copy of the same bytes. */
 export declare function rememberShape(body: Buffer, shape: BodyShape | undefined): void;
 /** Digest of the frame and the first `count` messages; undefined past the end. */
-export declare function prefixDigest(shape: BodyShape, count: number, frame?: string): string | undefined;
+export declare function prefixDigest(shape: BodyShape, count: number): string | undefined;
 /** Canonical text bytes (images left out) of messages [from, to). */
 export declare function textBytes(shape: BodyShape, from: number, to?: number): number;
 //# sourceMappingURL=body-shape.d.ts.map

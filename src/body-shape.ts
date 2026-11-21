@@ -15,7 +15,6 @@
  * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
-import { isClaudeCodeBillingHeader } from "./cc-request.js";
 import { imageDimensions } from "./image-tokens.js";
 
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
@@ -24,10 +23,6 @@ export const SHAPE_MIN_BYTES = 256 * 1024;
 export interface BodyShape {
   /** Hash of the body without `messages` (system, tools, thinking, ...). */
   frame: string;
-  /** Same frame with the per-request billing text removed. Only the failed-count
-   * fallback uses it and charges the current billing text in full. */
-  billingFrame?: string;
-  billingBytes?: number;
   /** One hash per message, in order. */
   messages: string[];
   /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
@@ -54,9 +49,6 @@ export interface BodyShape {
    * Anthropic counted expanded; one appended disables the anchor.
    */
   lastExpanding: number;
-  /** Last message with content that cannot be sized from its bytes or image dimensions. */
-  lastUnsized: number;
-  frameAnchorable: boolean;
   /**
    * Canonical bytes of the frame fields left out of the hash because Claude Code rewrites
    * them every turn (UNHASHED_FIELDS): an anchored bound charges them in full each time, on
@@ -68,8 +60,8 @@ export interface BodyShape {
 const shapes = new WeakMap<Buffer, BodyShape | null>();
 
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
-export function bodyShape(body: Buffer, includeSmall = false): BodyShape | undefined {
-  if (!includeSmall && body.length < SHAPE_MIN_BYTES) return undefined;
+export function bodyShape(body: Buffer): BodyShape | undefined {
+  if (body.length < SHAPE_MIN_BYTES) return undefined;
   if (!shapes.has(body)) shapes.set(body, computeShape(body));
   return shapes.get(body) ?? undefined;
 }
@@ -85,9 +77,9 @@ export function rememberShape(body: Buffer, shape: BodyShape | undefined): void 
 }
 
 /** Digest of the frame and the first `count` messages; undefined past the end. */
-export function prefixDigest(shape: BodyShape, count: number, frame = shape.frame): string | undefined {
+export function prefixDigest(shape: BodyShape, count: number): string | undefined {
   if (!Number.isInteger(count) || count < 0 || count > shape.messages.length) return undefined;
-  const hash = createHash("sha256").update(frame);
+  const hash = createHash("sha256").update(shape.frame);
   for (let i = 0; i < count; i++) hash.update(shape.messages[i]);
   return hash.digest("hex");
 }
@@ -113,35 +105,20 @@ function computeShape(body: Buffer): BodyShape | null {
   if (!Array.isArray(messages)) return null;
   const unhashed = UNHASHED_FIELDS.filter((key) => frame[key] !== undefined)
     .map((key) => JSON.stringify(frame[key])).join("");
-  const canonical = canonicalFrame(frame);
-  const shape: BodyShape = { frame: hash(JSON.stringify(canonical)),
+  const shape: BodyShape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
     messages: [], sizes: [], imageChars: [],
     serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
-    imageDims: [], unanchorable: false, frameAnchorable: frameAnchorable(frame), lastUnsized: -1, lastExpanding: -1,
+    imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
     unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
-  if (Array.isArray(canonical.system)) {
-    let billingBytes = 0;
-    const system = canonical.system.map(block => {
-      if (block?.type !== "text" || typeof block.text !== "string" ||
-          !isClaudeCodeBillingHeader(block.text)) return block;
-      billingBytes += Buffer.byteLength(JSON.stringify(block.text));
-      return { ...block, text: "" };
-    });
-    if (billingBytes) {
-      shape.billingFrame = hash(JSON.stringify({ ...canonical, system }));
-      shape.billingBytes = billingBytes;
-    }
-  }
   for (const message of messages) {
     const text = JSON.stringify(canonicalMessage(message)) ?? "";
     shape.messages.push(hash(text));
     shape.sizes.push(Buffer.byteLength(text, "utf-8"));
     shape.imageChars.push(imageCharsOf(message, shape));
     if (!message || typeof message !== "object" ||
-        !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key))) shape.lastUnsized = shape.messages.length - 1;
+        !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key))) shape.unanchorable = true;
     if (text.includes('"type":"tool_reference"')) shape.lastExpanding = shape.messages.length - 1;
   }
-  shape.unanchorable = !shape.frameAnchorable || shape.lastUnsized >= 0;
   return shape;
 }
 
@@ -186,19 +163,14 @@ function withoutMarker(block: unknown): unknown {
  * image's dimensions, and any image that is not inline, are noted on `shape`. */
 function imageCharsOf(message: unknown, shape: BodyShape): number {
   const content = (message as { content?: unknown } | null)?.content;
-  if (Array.isArray(content)) return blockImageChars(content, shape);
-  if (typeof content !== "string") shape.lastUnsized = shape.messages.length - 1;
-  return 0;
+  return Array.isArray(content) ? blockImageChars(content, shape) : 0;
 }
 
 function blockImageChars(blocks: unknown[], shape: BodyShape, nested = false): number {
   let total = 0;
   for (const item of blocks) {
     const block = item as Record<string, unknown> | null;
-    if (!block || typeof block !== "object") {
-      shape.lastUnsized = shape.messages.length - 1;
-      continue;
-    }
+    if (!block || typeof block !== "object") continue;
     const source = block.source as Record<string, unknown> | undefined;
     if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
       total += source.data.length;
@@ -206,10 +178,10 @@ function blockImageChars(blocks: unknown[], shape: BodyShape, nested = false): n
     } else if (block.type === "tool_result" && !nested) {
       if (Array.isArray(block.content)) total += blockImageChars(block.content, shape, true);
       else if (block.content !== undefined && typeof block.content !== "string") {
-        shape.lastUnsized = shape.messages.length - 1;
+        shape.unanchorable = true;
       }
     } else if (!(nested ? NESTED_BLOCKS : MESSAGE_BLOCKS).has(String(block.type))) {
-      shape.lastUnsized = shape.messages.length - 1;
+      shape.unanchorable = true;
     }
   }
   return total;

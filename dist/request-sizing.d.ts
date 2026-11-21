@@ -25,7 +25,7 @@ export interface CandidateMeasurement {
     /** Advisory estimate retained for compression and stale-estimate diagnostics. */
     estimatedTokens: number;
     count?: CountTokensResult;
-    /** The local byte limit or an unverified count failure rules out these bytes. */
+    /** Over Anthropic's request size limit: it cannot be sent natively at any size. */
     tooLarge?: true;
 }
 export interface RequestCandidate {
@@ -45,38 +45,31 @@ export declare class RequestSizing {
     private readonly counts;
     private readonly enabled;
     private readonly model?;
-    private readonly lastExact?;
-    private readonly rememberExact?;
-    /** Input allowances derived from a verified prefix after a count actually failed. */
-    private readonly failedCountSizes;
     private readonly candidates;
     private readonly excludedFallbacks;
     /** `model` is the request's model: it picks the tokenizer family's ratio. */
-    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined, lastExact?: CountedPrefix | undefined, rememberExact?: ((prefix: CountedPrefix) => void) | undefined);
+    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined);
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */
     excludeFallback(candidate: RequestCandidate): void;
     /** Every registered candidate planning has not excluded, in registration order. */
     fallbacks(): RequestCandidate[];
-    /** An exact count wins, then the guarded count-failure estimate, then the normal projection. */
+    /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
     plan(candidate: RequestCandidate): PlannedSize;
     /** Whether this body could still get an exact count: counting is on and
      * no attempt for these bytes has completed (a failed one is reused). */
     canCount(candidate: RequestCandidate): boolean;
     /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
     canRetryCount(candidate: RequestCandidate): boolean;
-    /** Whether the transport byte limit rules out this body. */
+    /** Whether Anthropic would refuse this body's size (413) before reading it. */
     exceedsRequestLimit(candidate: RequestCandidate): boolean;
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean;
     /** Count a body at planning when only a count could admit it: no exact
      * count and its conservative bound does not fit. Delivery reuses the result. */
     countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void>;
-    failedCountTokens(candidate: RequestCandidate): number | undefined;
-    private count;
-    private recordExact;
-    private failedOriginalNeedsCompression;
+    /** Whether this body's size is an exact Count Tokens result. */
     /** An exact count already made for these bytes, if any; never counts. */
     exactTokensFor(body: Buffer): number | undefined;
     isExact(candidate: RequestCandidate): boolean;
@@ -145,17 +138,7 @@ export declare const ANCHOR_MARGIN = 0.1;
  * canonical messages, never a raw byte difference, which a re-encoded prefix (escapes
  * written literally) could shrink to hide new content (Codex r2 P1).
  */
-export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined, margin?: number): number | undefined;
-/** Most recent Count Tokens success for this session, lane and model. */
-export interface CountedPrefix {
-    tokens: number;
-    model: string;
-    messageCount: number;
-    prefixDigest: string;
-    billingDigest?: string;
-    images: number;
-    at: number;
-}
+export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined): number | undefined;
 /**
  * Whether `body` extends the body `sample` measured, on the same model: the sample's
  * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only

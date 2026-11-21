@@ -279,7 +279,7 @@ test("abort and diagnostic callback failure cannot reject or duplicate an attemp
   } finally { srv.close(); }
 });
 
-test("failed HTTP count is cached within its request, without a second upload", async () => {
+test("persistent 500 retries twice and caches the final failure", async () => {
   const srv = await countServer((_req, res) => { res.writeHead(500); res.end("{}"); });
   try {
     const attempts = [];
@@ -290,8 +290,8 @@ test("failed HTTP count is cached within its request, without a second upload", 
     assert.equal(first.tokens, undefined);
     assert.equal(await session.count(Buffer.from(messagesBody)), first);
     assert.equal(session.peek(messagesBody), first);
-    assert.equal(srv.seen.length, 1);
-    assert.equal(attempts.length, 1);
+    assert.equal(srv.seen.length, 3);
+    assert.equal(attempts.length, 3);
   } finally { srv.close(); }
 });
 
@@ -394,39 +394,5 @@ test("preparing each count body is charged to the shared allowance", async () =>
     const spent = attempts.slice(0, 3).reduce((total, r) => total + r.ms, 0);
     assert.equal(last.outcome, "timeout");
     assert.ok(last.timeoutMs <= 2_000 - spent + 5, `${last.timeoutMs} left after ${spent}ms`);
-  } finally { srv.close(); }
-});
-
-test("a brief count retry and delivery retry each have one request-wide allowance", async () => {
-  const srv = await countServer(req => req.socket.destroy());
-  try {
-    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
-      timeoutMs: 5000 });
-    assert.equal((await session.count(messagesBody)).outcome, "network-error");
-    const brief = await session.retry(messagesBody, 1000);
-    assert.equal(brief.outcome, "network-error");
-    assert.ok(brief.timeoutMs <= 1000);
-    assert.equal(session.retry(messagesBody, 1000), undefined);
-    const delivery = await session.retry(messagesBody);
-    assert.equal(delivery?.outcome, "network-error");
-    assert.ok(delivery.timeoutMs > 1000);
-    const changed = Buffer.from('{"model":"other","messages":[]}');
-    assert.equal((await session.count(changed)).outcome, "network-error");
-    assert.equal(session.retry(changed, 1000), undefined);
-    assert.equal(session.retry(changed), undefined);
-    assert.equal(srv.seen.length, 4);
-  } finally { srv.close(); }
-});
-
-test("the size text in a slow count error body does not affect delivery eligibility", async () => {
-  const srv = await countServer((_req, res) => {
-    res.writeHead(400);
-    res.write('{"error":{"message":"prompt is too long"');
-  });
-  try {
-    const result = await countUpstreamTokens({ upstream: srv.upstream, headers: {},
-      body: messagesBody, timeoutMs: 200 });
-    assert.equal(result.outcome, "http-error");
-    assert.equal(result.status, 400);
   } finally { srv.close(); }
 });
