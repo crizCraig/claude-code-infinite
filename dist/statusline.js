@@ -369,58 +369,14 @@ function backup(file) {
     fs.copyFileSync(file, copy);
     fs.chmodSync(copy, fileMode(realTarget(file)) ?? 0o600);
 }
-function statusLineFromSettings(file) {
-    const parsed = readJson(file);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-        return { found: false };
-    if (!Object.prototype.hasOwnProperty.call(parsed, "statusLine"))
-        return { found: false };
-    const statusLine = parsed.statusLine;
-    return {
-        found: true,
-        command: statusLine && typeof statusLine === "object" ? statusLine.command : undefined,
-    };
-}
-function commandWantsLink(command) {
-    return typeof command === "string" && (CCC_STATUSLINE.test(command) ||
-        command.includes(".claude-code-infinite/statusline") ||
-        command.includes(".claude-code-infinite\\statusline"));
-}
 /**
  * Whether auto-install should preserve a command that already includes ccc's link.
  */
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings) {
-    return commandWantsLink(statusLineFromSettings(settingsFile).command);
-}
-/**
- * Whether the effective status line (project local -> project -> user) shows ccc's link.
- */
-export function effectiveStatusLineWantsLink(userSettings = statuslinePaths().settings, cwd = process.cwd()) {
-    for (const file of [
-        path.join(cwd, ".claude", "settings.local.json"),
-        path.join(cwd, ".claude", "settings.json"),
-        userSettings,
-    ]) {
-        const entry = statusLineFromSettings(file);
-        if (entry.found)
-            return commandWantsLink(entry.command);
-    }
-    return false;
-}
-/**
- * Decide status-line link file writing and per-request refresh for a session.
- * Interactive sessions always write the link file (for manual README snippets incl. Windows,
- * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Per-request refreshes run
- * only when the effective status line is known to show the link or CCC_STATUSLINE_REFRESH=1.
- * Headless/non-interactive runs have no status line and do no status-link file work.
- */
-export function resolveStatusLinkConfig(opts) {
-    if (!opts.interactive)
-        return { enabled: false, refresh: false };
-    const env = opts.env ?? process.env;
-    const refresh = env.CCC_STATUSLINE_REFRESH === "1" ||
-        effectiveStatusLineWantsLink(opts.userSettings, opts.cwd);
-    return { enabled: true, refresh };
+    const command = (readJson(settingsFile)
+        ?.statusLine)?.command;
+    return typeof command === "string" &&
+        (CCC_STATUSLINE.test(command) || command.includes(".claude-code-infinite/statusline"));
 }
 function writeStdout(text) {
     return new Promise((resolve, reject) => process.stdout.write(text, err => err ? reject(err) : resolve()));

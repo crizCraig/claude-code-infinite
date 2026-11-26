@@ -47,27 +47,4 @@ export declare function processTree(pid: number | undefined): number[];
  * Whether auto-install should preserve a command that already includes ccc's link.
  */
 export declare function statusLineWantsLink(settingsFile?: string): boolean;
-/**
- * Whether the effective status line (project local -> project -> user) shows ccc's link.
- */
-export declare function effectiveStatusLineWantsLink(userSettings?: string, cwd?: string): boolean;
-export interface StatusLinkConfig {
-    /** Write `<config>/statusline/<session>.url` and check heartbeats on Stop. */
-    enabled: boolean;
-    /** Refresh newest-tree lookups per minute during `/v1/messages` tool loops. */
-    refresh: boolean;
-}
-/**
- * Decide status-line link file writing and per-request refresh for a session.
- * Interactive sessions always write the link file (for manual README snippets incl. Windows,
- * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Per-request refreshes run
- * only when the effective status line is known to show the link or CCC_STATUSLINE_REFRESH=1.
- * Headless/non-interactive runs have no status line and do no status-link file work.
- */
-export declare function resolveStatusLinkConfig(opts: {
-    interactive: boolean;
-    userSettings: string;
-    cwd?: string;
-    env?: NodeJS.ProcessEnv;
-}): StatusLinkConfig;
 //# sourceMappingURL=statusline.d.ts.map

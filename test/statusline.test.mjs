@@ -9,9 +9,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { StatusLinkFiles, readStatusLink } from "../dist/status-link.js";
 import {
-  STATUSLINE_COMMAND, WRAPPED_ENV, effectiveStatusLineWantsLink, installStatusline, linkSegment,
-  renderStatusline, resolveStatusLinkConfig, runWrapped, statusLineWantsLink, statuslinePaths,
-  uninstallStatusline,
+  STATUSLINE_COMMAND, WRAPPED_ENV, installStatusline, linkSegment, renderStatusline, runWrapped,
+  statusLineWantsLink, statuslinePaths, uninstallStatusline,
 } from "../dist/statusline.js";
 import {
   NEWEST_TREE_CURRENT_WAIT_MS, NEWEST_TREE_FETCH_TIMEOUT_MS, NewestTreeLookup,
@@ -300,88 +299,4 @@ test("a wrapped command that fails or is killed shows nothing of its own", { ski
   assert.equal(await runWrapped("printf ok", "{}"), "ok");
   assert.equal(await runWrapped("printf partial; exit 1", "{}"), "");
   assert.equal(await runWrapped("printf partial; kill -TERM $$", "{}"), "");
-});
-
-test("interactive sessions always write status-line link files; refresh follows effective config or CCC_STATUSLINE_REFRESH=1", () => {
-  const mkProject = (projectStatusLine, localStatusLine) => {
-    const cwd = tmp();
-    if (projectStatusLine !== undefined || localStatusLine !== undefined) {
-      fs.mkdirSync(path.join(cwd, ".claude"), { recursive: true });
-    }
-    if (projectStatusLine !== undefined) {
-      fs.writeFileSync(path.join(cwd, ".claude", "settings.json"),
-        JSON.stringify(projectStatusLine === null ? {} : { statusLine: projectStatusLine }));
-    }
-    if (localStatusLine !== undefined) {
-      fs.writeFileSync(path.join(cwd, ".claude", "settings.local.json"),
-        JSON.stringify(localStatusLine === null ? {} : { statusLine: localStatusLine }));
-    }
-    return cwd;
-  };
-
-  // 1. Manual README snippet (e.g. bash ~/.claude/statusline.sh, incl. Windows): link files stay enabled.
-  const manual = setup({ type: "command", command: "bash ~/.claude/statusline.sh" });
-  const emptyCwd = mkProject();
-  assert.deepEqual(
-    resolveStatusLinkConfig({ interactive: true, userSettings: manual.paths.settings, cwd: emptyCwd, env: {} }),
-    { enabled: true, refresh: false }
-  );
-  assert.deepEqual(
-    resolveStatusLinkConfig({
-      interactive: true, userSettings: manual.paths.settings, cwd: emptyCwd,
-      env: { CCC_STATUSLINE_REFRESH: "1" },
-    }),
-    { enabled: true, refresh: true }
-  );
-
-  // Inline Windows backslash snippet is recognized directly.
-  const winInline = setup({ type: "command", command: "type %USERPROFILE%\\.claude-code-infinite\\statusline\\x.url" });
-  assert.equal(statusLineWantsLink(winInline.paths.settings), true);
-  assert.deepEqual(
-    resolveStatusLinkConfig({ interactive: true, userSettings: winInline.paths.settings, cwd: emptyCwd, env: {} }),
-    { enabled: true, refresh: true }
-  );
-
-  // 2. CCC_STATUSLINE_AUTO=0 with manually installed `ccc statusline`: link files and refresh both stay enabled.
-  const autoOff = setup({ type: "command", command: STATUSLINE_COMMAND });
-  assert.deepEqual(
-    resolveStatusLinkConfig({
-      interactive: true, userSettings: autoOff.paths.settings, cwd: emptyCwd,
-      env: { CCC_STATUSLINE_AUTO: "0" },
-    }),
-    { enabled: true, refresh: true }
-  );
-
-  // 3. Project-scope statusLine in .claude/settings.json or .claude/settings.local.json.
-  const noUser = setup(undefined);
-  const projectCcc = mkProject({ type: "command", command: STATUSLINE_COMMAND });
-  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc), true);
-  assert.deepEqual(
-    resolveStatusLinkConfig({ interactive: true, userSettings: noUser.paths.settings, cwd: projectCcc, env: {} }),
-    { enabled: true, refresh: true }
-  );
-  const projectLocalCcc = mkProject({ type: "command", command: OWN_COMMAND },
-    { type: "command", command: STATUSLINE_COMMAND });
-  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectLocalCcc), true);
-
-  // Project-scope statusLine overriding user's `ccc statusline` with a custom script still writes link files,
-  // and does not refresh per-request unless CCC_STATUSLINE_REFRESH=1 is set.
-  const projectCustom = mkProject({ type: "command", command: OWN_COMMAND });
-  assert.equal(effectiveStatusLineWantsLink(autoOff.paths.settings, projectCustom), false);
-  assert.deepEqual(
-    resolveStatusLinkConfig({ interactive: true, userSettings: autoOff.paths.settings, cwd: projectCustom, env: {} }),
-    { enabled: true, refresh: false }
-  );
-  // Project settings without a statusLine key inherit the user's statusLine.
-  const projectOtherKey = mkProject(null);
-  assert.equal(effectiveStatusLineWantsLink(autoOff.paths.settings, projectOtherKey), true);
-
-  // 4. Headless / non-interactive runs never write status-line link files or refresh per request.
-  assert.deepEqual(
-    resolveStatusLinkConfig({
-      interactive: false, userSettings: autoOff.paths.settings, cwd: projectCcc,
-      env: { CCC_STATUSLINE_REFRESH: "1" },
-    }),
-    { enabled: false, refresh: false }
-  );
 });
