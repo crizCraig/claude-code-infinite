@@ -742,7 +742,8 @@ async function main() {
   const signInSessionLine: { text?: string } = {};
   // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
   // Claude Code reads its settings; what changed is said at the first SessionStart.
-  const paths = interactiveUi ? statuslinePaths() : undefined;
+  const interactiveTerminal = interactiveUi && !mayBePrintInvocation(claudeArgs);
+  const paths = interactiveTerminal ? statuslinePaths() : undefined;
   const statusline = { text: paths ? autoInstallStatusline(paths) : undefined };
   // Check after auto-install so a newly installed status line gets per-request refreshes
   // this session. Interactive sessions always write the link file so manual snippets (incl.
@@ -816,7 +817,7 @@ async function main() {
     claudeNativeOneMillionContextEnabled(process.env);
   // Headless / print runs have no interactive display hooks or status line, so display links are off
   // while explicit memory operations (/memtree/current, subagent hints) still use newestTrees.
-  const memtreeLinkPlacement = interactiveUi
+  const memtreeLinkPlacement = interactiveTerminal
     ? memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK)
     : "off";
   const memtreeLinkStore = new MemtreeLinkStore();
@@ -893,7 +894,7 @@ async function main() {
     // front of the user: interactive (also not `-pc`-style print), not SSH
     // or CI (open-url.ts).
     openUrl: urlOpenerFor({
-      interactive: interactiveUi && !mayBePrintInvocation(claudeArgs),
+      interactive: interactiveTerminal,
       env: process.env, platform: process.platform,
       memtreeBaseUrl,
     }),

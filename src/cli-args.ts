@@ -4,67 +4,11 @@ export interface WrapperArgs {
   debug: boolean;
 }
 
-/**
- * Claude Code options that require a following argument value when passed
- * without `=`. Any `-p` / `--print` immediately after one of these is its
- * value (opening the interactive UI), not Claude Code's print flag.
- */
-const CLAUDE_VALUE_OPTIONS = new Set([
-  "-n", "--name",
-  "--add-dir",
-  "--agent",
-  "--agents",
-  "--allowedTools", "--allowed-tools",
-  "--append-system-prompt", "--append-system-prompt-file",
-  "--autocompact",
-  "--betas",
-  "--debug-file",
-  "--disallowedTools", "--disallowed-tools",
-  "--effort",
-  "--environment",
-  "--fallback-model",
-  "--file",
-  "--input-format",
-  "--json-schema",
-  "--max-budget-usd",
-  "--max-turns",
-  "--mcp-config",
-  "--model",
-  "--output-format",
-  "--permission-mode",
-  "--permission-prompt-tool",
-  "--permission-prompts",
-  "--plugin-dir",
-  "--plugin-url",
-  "--remote-control-session-name-prefix",
-  "--session-id",
-  "--setting-sources",
-  "--settings",
-  "--system-prompt", "--system-prompt-file",
-  "--system-prompt-snapshot",
-  "--tools",
-]);
-
-/** Whether `arg` is a Claude Code option that consumes the next argv element as its value. */
-export function takesRequiredOptionValue(arg: string): boolean {
-  return CLAUDE_VALUE_OPTIONS.has(arg) || /^-[c]+n$/.test(arg);
-}
-
-/**
- * Whether Claude's own print mode (`-p` / `--print`) was requested before `--`.
- * Argument-aware and conservative: option values (e.g. `--model -p`, `-n -p`),
- * attached short-flag values or clusters (`-dmcp`, `-pc`), and anything after `--`
- * are not treated as print mode (matching Claude Code opening its interactive UI).
- */
-export function isPrintInvocation(args: readonly string[]): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
+/** Whether Claude's own print mode was requested before its `--` separator. */
+export function isPrintInvocation(args: string[]): boolean {
+  for (const arg of args) {
     if (arg === "--") return false;
     if (arg === "-p" || arg === "--print") return true;
-    if (takesRequiredOptionValue(arg)) {
-      if (args[i + 1] === "--") return false;
-      i++;
-    }
   }
   return false;
 }
