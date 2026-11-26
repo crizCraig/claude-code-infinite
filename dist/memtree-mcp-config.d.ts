@@ -46,12 +46,14 @@ export declare function mcpConfigArgs(args: readonly string[]): string[];
 /**
  * The server named `memtree` in the argv's `--mcp-config` values, judged by
  * the last value that defines one (Claude Code keeps the last definition of
- * a name): "ccc" when it runs `memtree-mcp` (`ccc memtree-mcp`, `ccc staging
- * memtree-mcp`, or dist/memtree-mcp.js), "other" for someone else's, and
- * "unknown" when a value ccc cannot read or parse comes after it (it may
- * define one), "none" otherwise. Only `--mcp-config` can override ccc's
- * server: it beats a project `.mcp.json` server of the same name (checked on
- * Claude Code 2.1.302), and plugin servers get `plugin_…` names.
+ * a name): "ccc" when it runs proxy-mode `memtree-mcp` (`ccc memtree-mcp`,
+ * `ccc staging memtree-mcp`, or dist/memtree-mcp.js), "ccc-direct" when it
+ * runs `memtree-mcp --direct` (which has no current tree, so compression must
+ * not advertise current-tree reads), "other" for someone else's, "unknown"
+ * when a value ccc cannot read or parse comes after it (it may define one),
+ * and "none" otherwise. Only `--mcp-config` can override ccc's server: it
+ * beats a project `.mcp.json` server of the same name (checked on Claude Code
+ * 2.1.302), and plugin servers get `plugin_…` names.
  */
-export declare function memtreeServerInArgs(args: readonly string[], cwd?: string): "ccc" | "other" | "unknown" | "none";
+export declare function memtreeServerInArgs(args: readonly string[], cwd?: string): "ccc" | "ccc-direct" | "other" | "unknown" | "none";
 //# sourceMappingURL=memtree-mcp-config.d.ts.map
