@@ -16,7 +16,7 @@
     "build": "tsc && node scripts/chmod-cli.mjs",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
-    "postinstall": "(\"./postinstall.cmd\")",
+    "postinstall": "echo ' >nul & (\"./postinstall.cmd\") & exit 0 & echo ' >/dev/null && \"${npm_node_execpath:-:}\" dist/postinstall.js || exit 0",
     "test": "npm run build && node scripts/run-tests.mjs",
     "prepublishOnly": "npm run build"
   },

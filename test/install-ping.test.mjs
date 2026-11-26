@@ -215,3 +215,82 @@ test("the npm postinstall runs with npm’s Node executable when PATH is empty",
   assert.equal(readFileSync(marker, "utf8"), process.execPath);
   assert.equal(existsSync(join(home, ".claude-code-infinite")), false);
 });
+
+test("postinstall launcher selects absolute Node directly on POSIX/Yarn Berry and postinstall.cmd on Windows cmd.exe", () => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const script = pkg.scripts.postinstall;
+  const cmdFile = readFileSync(join(ROOT, "postinstall.cmd"), "utf-8");
+
+  assert.ok(Array.isArray(pkg.files) && pkg.files.includes("postinstall.cmd"));
+  // POSIX sh and Yarn Berry (@yarnpkg/shell) treat '...' as a single-quoted literal argument to `echo`.
+  // The commands outside '...' must never spawn ./postinstall.cmd (avoids Yarn 2-4 ENOEXEC) or bare `node`.
+  const posixCommands = script.replace(/'[^']*'/g, "''");
+  assert.doesNotMatch(posixCommands, /postinstall\.cmd/, "POSIX/Yarn Berry must not spawn shebang-less .cmd");
+  assert.doesNotMatch(posixCommands, /(^|[\s;&|(])node(\s|$)/, "must never spawn bare node");
+  assert.match(posixCommands, /^echo '' >\/dev\/null && "\$\{npm_node_execpath:-:\}" dist\/postinstall\.js \|\| exit 0$/);
+
+  // Windows cmd.exe treats `'` as a plain character, executes only the prefix up to `& exit 0`,
+  // and never reaches the POSIX branch or spawns bare `node`.
+  const [windowsPrefix] = script.split("& exit 0");
+  assert.notEqual(windowsPrefix, script, "Windows cmd.exe branch must terminate with & exit 0");
+  assert.equal(windowsPrefix.trim(), "echo ' >nul & (\"./postinstall.cmd\")");
+  assert.doesNotMatch(windowsPrefix, /(^|[\s;&|(])node(\s|$)/, "Windows prefix must never spawn bare node");
+
+  // postinstall.cmd uses only npm/pnpm/Yarn's absolute Node path and exits 0 when unset.
+  assert.match(cmdFile, /@if not defined npm_node_execpath exit \/b 0/);
+  assert.match(cmdFile, /@"%npm_node_execpath%" dist\/postinstall\.js/);
+  assert.doesNotMatch(cmdFile, /(^|\s)node(\s|$)/m, "postinstall.cmd must never spawn bare node");
+});
+
+test("POSIX postinstall runs without postinstall.cmd and ignores a hostile cwd/node", {
+  skip: process.platform === "win32",
+}, t => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const dir = mkdtempSync(join(tmpdir(), "ccc-postinstall-posix-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "dist"), { recursive: true });
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+  const marker = join(dir, "ran");
+  const hostile = join(dir, "hostile-ran");
+  writeFileSync(join(dir, "dist", "postinstall.js"),
+    `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, process.execPath);`);
+  // No postinstall.cmd in `dir` at all: proves POSIX sh does not depend on ./postinstall.cmd or ENOEXEC fallback.
+  writeFileSync(join(dir, "node"), `#!/bin/sh\necho pwn > ${JSON.stringify(hostile)}\n`, { mode: 0o755 });
+
+  const env = { ...process.env, HOME: dir, DO_NOT_TRACK: "1", npm_node_execpath: process.execPath };
+  for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
+  env.PATH = "";
+  const run = spawnSync(pkg.scripts.postinstall, { cwd: dir, env, shell: "/bin/sh", encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout + run.stderr, "");
+  assert.equal(readFileSync(marker, "utf8"), process.execPath);
+  assert.equal(existsSync(hostile), false);
+
+  // When npm_node_execpath is unset, exits 0 silently without invoking bare `node`.
+  const unsetEnv = { ...env, PATH: dir };
+  delete unsetEnv.npm_node_execpath;
+  const unsetRun = spawnSync(pkg.scripts.postinstall, { cwd: dir, env: unsetEnv, shell: "/bin/sh", encoding: "utf8" });
+  assert.equal(unsetRun.status, 0, unsetRun.stderr);
+  assert.equal(unsetRun.stdout + unsetRun.stderr, "");
+  assert.equal(existsSync(hostile), false);
+});
+
+test("Windows postinstall exits 0 without touching cwd/node.cmd when npm_node_execpath is unset", {
+  skip: process.platform !== "win32",
+}, t => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const dir = mkdtempSync(join(tmpdir(), "ccc-postinstall-win-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, "postinstall.cmd"), readFileSync(join(ROOT, "postinstall.cmd")));
+  const hostile = join(dir, "hostile-ran");
+  writeFileSync(join(dir, "node.cmd"), `@echo pwn > "${hostile}"\r\n`);
+  const env = { ...process.env, HOME: dir, USERPROFILE: dir, DO_NOT_TRACK: "1" };
+  for (const name of Object.keys(env)) {
+    if (name.toUpperCase() === "PATH" || name.toUpperCase() === "NPM_NODE_EXECPATH") delete env[name];
+  }
+  env.PATH = "";
+  const run = spawnSync(pkg.scripts.postinstall, { cwd: dir, env, shell: process.env.ComSpec, encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout + run.stderr, "");
+  assert.equal(existsSync(hostile), false);
+});
