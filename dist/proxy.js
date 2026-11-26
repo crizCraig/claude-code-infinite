@@ -415,6 +415,7 @@ export function startProxy(opts) {
         newestTrees: opts.newestTrees,
         statusLinks: opts.statusLinks,
         stableSessionLinks: new Map(),
+        statusLinkRefresh: opts.statusLinkRefresh === true,
         statusLineSince: opts.statusLineSince,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
@@ -1224,9 +1225,6 @@ onlyEvent) {
     let statusLineShows;
     const { statusLineSince, statusLinks } = state;
     if (stopMatchesMainPrompt && statusLineSince !== undefined && statusLinks) {
-        // Refresh the status line even when Stop has no trailer. A Stop trailer's own
-        // link resolver already refreshes the lookup when it needs a link.
-        state.newestTrees?.peek(parsed.session_id);
         statusLineShows = url => {
             const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
             return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
@@ -1441,16 +1439,16 @@ async function handleMessages(req, res, opts, upstream, state) {
             return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
     }
-    else if (state.newestTrees || state.statusLinks) {
-        // Keep the tree lookup warm through long tool runs. Once the stable URL is known,
-        // only an interactive status line needs its file restored if another process pruned it.
+    else if (state.statusLinks && state.statusLinkRefresh) {
+        // Keeps the status line's link fresh through long tool runs: answers from the cache,
+        // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
+        // whose stable link is known needs no lookup (that link never changes), only its file
+        // written again if another ccc process pruned it (a local read; Codex r9).
         const sessionId = requestSessionId(req);
-        if (sessionId && (state.stableSessionLinks.has(sessionId) || state.newestTrees?.sessionUrl(sessionId))) {
+        if (sessionId && state.stableSessionLinks.has(sessionId))
             publishStatusLink(state, sessionId);
-        }
-        else {
+        else
             state.newestTrees?.peek(sessionId);
-        }
     }
     const isLocalBashCommand = isLocalBashCommandTurn(messages);
     // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level

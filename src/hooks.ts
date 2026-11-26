@@ -259,7 +259,6 @@ export interface MessageDisplayHookInput {
 }
 
 export interface StopHookInput {
-  cwd?: string;
   hook_event_name: "Stop";
   session_id: string;
   stop_hook_active?: boolean;

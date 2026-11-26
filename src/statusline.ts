@@ -392,7 +392,8 @@ function backup(file: string): void {
 }
 
 /**
- * Whether auto-install should preserve a command that already includes ccc's link.
+ * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
+ * only then does the proxy keep the link fresh in the background. Read at startup.
  */
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings): boolean {
   const command = ((readJson(settingsFile) as { statusLine?: { command?: unknown } } | undefined)

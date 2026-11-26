@@ -130,7 +130,6 @@ export interface MessageDisplayHookInput {
     agent_id?: string;
 }
 export interface StopHookInput {
-    cwd?: string;
     hook_event_name: "Stop";
     session_id: string;
     stop_hook_active?: boolean;

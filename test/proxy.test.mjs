@@ -11638,7 +11638,7 @@ test("a known stable link is written again when another process pruned the file"
   const { lookup } = await newestLookup((q) => (
     { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
-    statusLinks: new StatusLinkFiles(dir) });
+    statusLinks: new StatusLinkFiles(dir), statusLinkRefresh: true });
   try {
     await lookup.settle("session-1");
     await armMainTurn(proxy, "turn two", "prompt-1");
