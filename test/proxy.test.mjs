@@ -11596,9 +11596,7 @@ test("with CCC_MEMTREE_LINK=off and no status line, model calls and hooks skip t
   await armMainTurn(proxy, "turn two", "prompt-1");
   await postSessionMessages(proxy.port, followupTurn("turn two"));
   assert.ok(memtreeSrv.calls.length >= 1);
-  // Stop may still show ccc's compression notice, but never a tree link.
-  const stop = await postHook(proxy, stopHook("prompt-1"));
-  assert.ok(stop.status === 204 || !JSON.stringify(stop.body).includes("/m/"));
+  assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(asked.length, 0);
 
