@@ -402,7 +402,13 @@ export interface ProxyOptions {
   newestTrees?: NewestTreeLookup;
   /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
-  /** Earliest status-line render from this run, when its status line is enabled. */
+  /**
+   * The status line is known to show the link (or opted in with CCC_STATUSLINE_REFRESH=1):
+   * refresh the newest tree on `/v1/messages` requests (at most once a minute) and restore
+   * a pruned stable-link file, not only at prompts and turn ends.
+   */
+  statusLinkRefresh?: boolean;
+  /** Earliest status-line render from this run, when running interactively. */
   statusLineSince?: number;
   /**
    * Per-response token usage (thinking share on the MemTree page), read from
@@ -679,6 +685,7 @@ interface ProxyState {
   statusLinks?: StatusLinkFiles;
   /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
   stableSessionLinks: Map<string, string>;
+  statusLinkRefresh: boolean;
   statusLineSince?: number;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
@@ -1236,6 +1243,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
     stableSessionLinks: new Map(),
+    statusLinkRefresh: opts.statusLinkRefresh === true,
     statusLineSince: opts.statusLineSince,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
@@ -2382,9 +2390,11 @@ async function handleMessages(
       const link = recapLink(state, sessionId);
       return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
     });
-  } else if (state.newestTrees || state.statusLinks) {
-    // Keep the tree lookup warm through long tool runs. Once the stable URL is known,
-    // only an interactive status line needs its file restored if another process pruned it.
+  } else if (state.statusLinks && state.statusLinkRefresh) {
+    // Keeps the status line's link fresh through long tool runs: answers from the cache,
+    // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
+    // whose stable link is known needs no lookup (that link never changes), only its file
+    // written again if another ccc process pruned it (a local read; Codex r9).
     const sessionId = requestSessionId(req);
     if (sessionId && (state.stableSessionLinks.has(sessionId) || state.newestTrees?.sessionUrl(sessionId))) {
       publishStatusLink(state, sessionId);

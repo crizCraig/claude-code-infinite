@@ -24,7 +24,7 @@ import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { StatusLinkFiles } from "./status-link.js";
-import { statuslinePaths, statusLineWantsLink } from "./statusline.js";
+import { resolveStatusLinkConfig, statuslinePaths } from "./statusline.js";
 import { autoInstallStatusline } from "./statusline-auto.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
@@ -566,10 +566,15 @@ async function main() {
     // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
     // Claude Code reads its settings; what changed is said at the first SessionStart.
     const interactiveTerminal = interactiveUi && !mayBePrintInvocation(claudeArgs);
-    const paths = interactiveTerminal && process.env.CCC_STATUSLINE_AUTO !== "0" ? statuslinePaths() : undefined;
+    const paths = interactiveTerminal ? statuslinePaths() : undefined;
     const statusline = { text: paths ? autoInstallStatusline(paths) : undefined };
-    // Check after auto-install so a newly installed status line gets its link this session.
-    const statusLinkEnabled = paths !== undefined && statusLineWantsLink(paths.settings);
+    // Check after auto-install so a newly installed status line gets per-request refreshes
+    // this session. Interactive sessions always write the link file so manual snippets (incl.
+    // Windows), CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines keep working;
+    // Stop suppression still requires a recent heartbeat from `ccc statusline`.
+    const statusLinkConfig = paths
+        ? resolveStatusLinkConfig({ interactive: true, userSettings: paths.settings })
+        : { enabled: false, refresh: false };
     // A sign-in completed after ccc's warning, between launches or mid-session.
     const signInTracker = new SignInTracker(getConfigDir(), (event) => diagnostics.record("sign_in_completed", { ...event }));
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
@@ -687,7 +692,11 @@ async function main() {
         toolOutputs: new ToolOutputStore(),
         // The link shown to the user follows the session's newest tree on the server.
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
-        ...(statusLinkEnabled ? { statusLinks: new StatusLinkFiles(), statusLineSince: Date.now() } : {}),
+        ...(statusLinkConfig.enabled ? {
+            statusLinks: new StatusLinkFiles(),
+            statusLinkRefresh: statusLinkConfig.refresh,
+            statusLineSince: Date.now(),
+        } : {}),
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed

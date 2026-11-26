@@ -11535,6 +11535,38 @@ test("headless Stop retains the link even with a recent render", async t => {
   assertStopLink(await stop());
 });
 
+test("status link files are written without statusLinkRefresh; Stop suppresses only with a heartbeat", async t => {
+  const { readStatusLink } = await import("../dist/status-link.js");
+  const { dir, files, render } = statuslineFixture(t);
+  const upstream = await mockUpstream();
+  t.after(() => upstream.close());
+  const stable = "https://staging.example/m/sessions/session-1";
+  const { lookup, asked } = await newestLookup(q => (
+    { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
+    upstreamOrigin: upstream.origin, newestTrees: lookup, statusLinks: files,
+    statusLinkRefresh: false, memtreeLinkPlacement: "stop", statusLineSince: Date.now(),
+  });
+  t.after(() => proxy.close());
+  // Without statusLinkRefresh, raw /v1/messages does not trigger /v1/memtree/sessions lookups.
+  await postSessionMessages(proxy.port, [{ role: "user", content: "hi" }]);
+  assert.equal(asked.length, 0);
+  assert.equal(readStatusLink("session-1", dir), undefined);
+  // Prompts still trigger the background lookup and write the status-line link file.
+  await armMainTurn(proxy, "turn two", "prompt-1");
+  for (let i = 0; i < 50 && readStatusLink("session-1", dir) !== stable; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(readStatusLink("session-1", dir), stable);
+  // Without a heartbeat (e.g. manual README snippet or Windows), Stop still prints the link.
+  assertStopLink(await postHook(proxy, stopHook("prompt-1")));
+  // Once `ccc statusline` renders and writes a heartbeat, Stop omits the routine link.
+  assert.equal(render(), stable);
+  await armMainTurn(proxy, "turn three", "prompt-2");
+  assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+});
+
 test("the status line links the session's stable page once the server names one", async () => {
   const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
   const fs = await import("node:fs");
@@ -11638,7 +11670,7 @@ test("a known stable link is written again when another process pruned the file"
   const { lookup } = await newestLookup((q) => (
     { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
-    statusLinks: new StatusLinkFiles(dir) });
+    statusLinks: new StatusLinkFiles(dir), statusLinkRefresh: true });
   try {
     await lookup.settle("session-1");
     await armMainTurn(proxy, "turn two", "prompt-1");

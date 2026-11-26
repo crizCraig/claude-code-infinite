@@ -53,7 +53,8 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
 function fakeClaudeHome({
-  key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus, statusLine, sessionScript = "",
+  key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus, statusLine,
+  projectStatusLine, isolatedCwd = false, sessionScript = "",
 } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
@@ -61,6 +62,15 @@ function fakeClaudeHome({
     const dir = path.join(home, ".claude");
     fs.mkdirSync(dir);
     fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ statusLine }));
+  }
+  let cwd;
+  if (projectStatusLine || isolatedCwd) {
+    cwd = path.join(home, "project");
+    fs.mkdirSync(cwd, { recursive: true });
+    if (projectStatusLine) {
+      fs.mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(cwd, ".claude", "settings.json"), JSON.stringify({ statusLine: projectStatusLine }));
+    }
   }
   const bin = path.join(home, "bin");
   fs.mkdirSync(bin);
@@ -95,11 +105,11 @@ function fakeClaudeHome({
     JSON.stringify({ localPolychatApiKey: key, diagnostics: false, updateCheck: false }),
     { mode: 0o600 });
   if (seenAuth) fs.writeFileSync(path.join(configDir, "claude-auth-seen"), `${seenAuth}\n`);
-  return { home, bin };
+  return { home, bin, cwd };
 }
 
 function runCcc(args, extraEnv = {}, home_ = {}, nodeArgs = []) {
-  const { home, bin } = fakeClaudeHome(home_);
+  const { home, bin, cwd } = fakeClaudeHome(home_);
   const env = {
     ...process.env, HOME: home, USERPROFILE: home, CCC_NO_DIAGNOSTICS: "1",
     PATH: `${bin}${path.delimiter}${process.env.PATH}`,
@@ -112,7 +122,9 @@ function runCcc(args, extraEnv = {}, home_ = {}, nodeArgs = []) {
     "CLAUDE_CODE_USE_FOUNDRY"]) delete env[name];
   Object.assign(env, extraEnv);
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [...nodeArgs, CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [...nodeArgs, CLI, "local", ...args], {
+      env, ...(cwd ? { cwd } : {}), stdio: ["pipe", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => { stdout += d; });
@@ -152,7 +164,7 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.doesNotMatch(stderr, /\x1b\[/);
 });
 
-test("model calls use status-link files only for an enabled, configured interactive status line", async t => {
+test("status-link files are written in interactive sessions (incl. manual/project/auto=0) and skipped when headless", async t => {
   let modelCalls = 0;
   let treeLookups = 0;
   const session = { session_id: "session-1", links: { url: "https://example.org/m/sessions/session-1" } };
@@ -184,6 +196,18 @@ test("model calls use status-link files only for an enabled, configured interact
       if ((await reply.json()).content[0].text !== "ok") throw Error("unexpected model reply");
     }
   `;
+  const resumeHookScript = `
+    {
+      const hookDir = args[args.indexOf("--plugin-dir") + 1];
+      const hookCfg = JSON.parse(fs.readFileSync(hookDir + "/hooks/hooks.json", "utf8")).hooks;
+      await fetch(hookCfg.UserPromptSubmit[0].hooks[0].url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "session-1" }),
+      });
+    }
+    ${sessionScript}
+  `;
   const trace = `
     import fs from "node:fs";
     for (const op of ["readFileSync", "writeFileSync", "renameSync", "unlinkSync", "statSync"]) {
@@ -195,24 +219,36 @@ test("model calls use status-link files only for an enabled, configured interact
     }
   `;
   const configured = { type: "command", command: "ccc statusline" };
-  for (const { name, args = [], tty = true, auto = "1", statusLine = configured, cache = false } of [
+  const manual = { type: "command", command: "bash ~/.claude/statusline.sh" };
+  for (const {
+    name, args = [], tty = true, auto = "1", refresh, statusLine = configured, projectStatusLine,
+    script = sessionScript, lookups = 0, cache = false,
+  } of [
     { name: "non-TTY", tty: false },
     { name: "print", args: ["-p", "hi"] },
     { name: "combined print flag", args: ["-pc", "hi"] },
-    { name: "interactive with auto-install off", auto: "0" },
-    { name: "interactive with an unsupported status line", statusLine: { type: "unsupported" } },
-    { name: "interactive with ccc configured", cache: true },
+    { name: "interactive with auto-install off and manual ccc statusline", auto: "0", lookups: 1, cache: true },
+    { name: "interactive with manual snippet on resume hook", auto: "0", statusLine: manual,
+      script: resumeHookScript, lookups: 1, cache: true },
+    { name: "interactive with manual snippet and CCC_STATUSLINE_REFRESH=1", auto: "0", refresh: "1",
+      statusLine: manual, lookups: 1, cache: true },
+    { name: "interactive with project-scope ccc statusline", auto: "0", statusLine: manual,
+      projectStatusLine: configured, lookups: 1, cache: true },
+    { name: "interactive with an unsupported status line skips per-request lookup",
+      statusLine: { type: "unsupported" } },
+    { name: "interactive with ccc configured", lookups: 1, cache: true },
   ]) {
     await t.test(name, async () => {
       const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
       const before = modelCalls;
       const lookupsBefore = treeLookups;
-      const { code, stderr } = await runCcc(args, { ...env, CCC_STATUSLINE_AUTO: auto },
-        { sessionScript, statusLine, authStatus: { loggedIn: false } },
+      const caseEnv = { ...env, CCC_STATUSLINE_AUTO: auto, CCC_STATUSLINE_REFRESH: refresh ?? "" };
+      const { code, stderr } = await runCcc(args, caseEnv,
+        { sessionScript: script, statusLine, projectStatusLine, isolatedCwd: true, authStatus: { loggedIn: false } },
         ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
       assert.equal(code, 0, stderr);
       assert.equal(modelCalls - before, 3);
-      assert.equal(treeLookups - lookupsBefore, 1, "the background lookup still runs");
+      assert.equal(treeLookups - lookupsBefore, lookups);
       if (cache) assert.match(stderr, /status-link I\/O writeFileSync/);
       else assert.doesNotMatch(stderr, /status-link I\/O/);
     });
