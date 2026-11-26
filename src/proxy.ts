@@ -2025,8 +2025,8 @@ async function handleNoticeHook(
     const restored = parsed.agent_id === undefined &&
         (parsed.source === "resume" || parsed.source === "fork")
       ? restoreModelNotices(state, parsed) : Promise.resolve();
-    // A resume waits briefly for the newest tree; a fresh session has none to wait for.
-    if (parsed.agent_id === undefined && parsed.source === "resume") {
+    // A resume waits briefly for the newest tree when a display uses it; a fresh session has none.
+    if (parsed.agent_id === undefined && parsed.source === "resume" && hasLinkDisplay(state)) {
       await state.newestTrees?.settle(parsed.session_id);
     }
     const line = joinNoticeLines(
@@ -2077,7 +2077,7 @@ async function handleNoticeHook(
     // In a subagent's view the command is answered too (with the main
     // session's page): unanswered, the plugin's fallback body would run.
     if (isMemtreeViewCommand(parsed.prompt)) await state.newestTrees?.settle(parsed.session_id);
-    else if (parsed.agent_id === undefined) state.newestTrees?.peek(parsed.session_id);
+    else if (parsed.agent_id === undefined && hasLinkDisplay(state)) state.newestTrees?.peek(parsed.session_id);
     const commandReply =
       parsed.agent_id === undefined
         ? sessionCommandReply(state, parsed.session_id, parsed.prompt)
@@ -2163,7 +2163,12 @@ async function handleNoticeHook(
   if (stopMatchesMainPrompt && statusLineSince !== undefined && statusLinks) {
     // Refresh the status line even when Stop has no trailer. A Stop trailer's own
     // link resolver already refreshes the lookup when it needs a link.
-    state.newestTrees?.peek(parsed.session_id);
+    if (state.memtreeLinkPlacement === "off" &&
+        (state.stableSessionLinks.has(parsed.session_id) || state.newestTrees?.sessionUrl(parsed.session_id))) {
+      publishStatusLink(state, parsed.session_id);
+    } else {
+      state.newestTrees?.peek(parsed.session_id);
+    }
     statusLineShows = url => {
       const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
       return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
@@ -4048,6 +4053,11 @@ function nextMemtreeCallSeq(state: ProxyState): number {
   return ++state.memtreeCallSeq;
 }
 
+/** Whether any UI display consumes newest-tree links (notices/trailers/recap, or status line). */
+function hasLinkDisplay(state: ProxyState): boolean {
+  return state.memtreeLinkPlacement !== "off" || state.statusLinks !== undefined;
+}
+
 /**
  * Adopt a compress response's MemTree page as the conversation's newest,
  * unless a call submitted later already reported one. Only a response that
@@ -4068,9 +4078,9 @@ function noteMemtreePage(
   const latest = state.memtreePages.get(sessionId);
   if (latest && latest.seq >= seq) return;
   const compressed = didMemtreeCompress(result!);
-  // A cached newest tree may predate this page; ask again (first, so the status line's
-  // link is this page until the lookup answers).
-  state.newestTrees?.invalidate(sessionId);
+  // A cached newest tree may predate this page; drop it, and refresh immediately only when a
+  // display uses it (first, so the status line's link is this page until the lookup answers).
+  state.newestTrees?.invalidate(sessionId, hasLinkDisplay(state));
   rememberMemtreePage(state, sessionId, { sessionId, url, index, compressed, seq });
   state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
 }

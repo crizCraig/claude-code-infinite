@@ -99,10 +99,12 @@ export declare class NewestTreeLookup {
      */
     current(sessionId: string, waitMs?: number): Promise<NewestTreeAnswer>;
     /**
-     * Forget a session's answer and ask again: a newer compress page just
-     * arrived, so a cached or in-flight answer may predate it.
+     * Forget a session's answer: a newer compress page just arrived, so a cached
+     * or in-flight answer may predate it. With `refresh` (default true), starts a
+     * replacement lookup in the background; with `refresh = false`, drops stale
+     * state without issuing a server request until a caller asks.
      */
-    invalidate(sessionId: string): void;
+    invalidate(sessionId: string, refresh?: boolean): void;
     private refresh;
     private fetch;
     /** All pages share one deadline; failures retain the last known answer. */

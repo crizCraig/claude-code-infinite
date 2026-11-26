@@ -637,7 +637,11 @@ async function main() {
         tools: memtreeMcpPlan.tools,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
-    const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
+    // Headless / print runs have no interactive display hooks or status line, so display links are off
+    // while explicit memory operations (/memtree/current, subagent hints) still use newestTrees.
+    const memtreeLinkPlacement = interactiveTerminal
+        ? memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK)
+        : "off";
     const memtreeLinkStore = new MemtreeLinkStore();
     const transcriptUsage = new ClaudeTranscriptUsage();
     // Opt-in HTTPS-proxy mode (Remote Control): skipped, with one line, where it can't work.

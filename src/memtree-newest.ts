@@ -83,7 +83,7 @@ interface Entry {
 export class NewestTreeLookup {
   private readonly entries = new Map<string, Entry>();
   private readonly inFlight = new Map<string, {
-    promise: Promise<NewestTree | undefined>; dirty: boolean;
+    promise: Promise<NewestTree | undefined>; dirty: boolean; refetch: boolean;
   }>();
   // Count the actual transports too: a fetch adapter ignoring abort must not
   // allow timed-out requests to accumulate behind new lookups.
@@ -169,9 +169,11 @@ export class NewestTreeLookup {
    * is kept. Waits at most twice `waitMs` (once more after an invalidation).
    */
   async current(sessionId: string, waitMs = NEWEST_TREE_CURRENT_WAIT_MS): Promise<NewestTreeAnswer> {
+    this.peek(sessionId);
+    const flight = this.inFlight.get(sessionId);
     await this.settle(sessionId, waitMs);
-    // A newer page invalidated the lookup it waited on: wait for its replacement.
-    if (!this.entries.has(sessionId) && this.inFlight.has(sessionId)) {
+    // A newer page invalidated the lookup it waited on: wait for (or start) its replacement.
+    if (!this.entries.has(sessionId) && (flight?.dirty || this.inFlight.has(sessionId))) {
       await this.settle(sessionId, waitMs);
     }
     const entry = this.entries.get(sessionId);
@@ -181,14 +183,20 @@ export class NewestTreeLookup {
   }
 
   /**
-   * Forget a session's answer and ask again: a newer compress page just
-   * arrived, so a cached or in-flight answer may predate it.
+   * Forget a session's answer: a newer compress page just arrived, so a cached
+   * or in-flight answer may predate it. With `refresh` (default true), starts a
+   * replacement lookup in the background; with `refresh = false`, drops stale
+   * state without issuing a server request until a caller asks.
    */
-  invalidate(sessionId: string): void {
+  invalidate(sessionId: string, refresh = true): void {
     this.entries.delete(sessionId);
     const running = this.inFlight.get(sessionId);
-    if (running) running.dirty = true;
-    else this.peek(sessionId);
+    if (running) {
+      running.dirty = true;
+      if (refresh) running.refetch = true;
+    } else if (refresh) {
+      this.peek(sessionId);
+    }
   }
 
   private refresh(sessionId: string): Promise<NewestTree | undefined> {
@@ -199,13 +207,17 @@ export class NewestTreeLookup {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.fetchTimeoutMs);
     timer.unref();
-    const flight = { promise: Promise.resolve<NewestTree | undefined>(undefined), dirty: false };
+    const flight = {
+      promise: Promise.resolve<NewestTree | undefined>(undefined),
+      dirty: false,
+      refetch: false,
+    };
     flight.promise = this.ask(sessionId, controller.signal).then((entry) => {
       clearTimeout(timer);
       this.inFlight.delete(sessionId);
       // Coalesce all invalidations during this lookup into one replacement.
       if (flight.dirty) {
-        this.peek(sessionId);
+        if (flight.refetch) this.peek(sessionId);
         return undefined;
       }
       if (entry) this.remember(sessionId, entry);
