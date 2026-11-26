@@ -99,27 +99,6 @@ test("peek never waits: it answers from the cache and refreshes after the TTL", 
   assert.equal(asked.length, 2);
 });
 
-test("peek with refresh=false returns cached state without starting or refreshing lookups", async () => {
-  const trees = [OLD_ID, NEW_ID];
-  const { lookup, asked, clock } = scripted((q, call) => ({ sessions: [item(q, trees[call])] }));
-  assert.equal(lookup.peek("session-1", false), undefined);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 0, "miss does not start a lookup");
-  await lookup.settle("session-1");
-  assert.equal(asked.length, 1);
-  assert.equal(lookup.peek("session-1", false).url, `https://staging.example/usage/memtree/${OLD_ID}-v1-own`);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 1);
-  clock.t += NEWEST_TREE_TTL_MS;
-  assert.equal(lookup.peek("session-1", false).url, `https://staging.example/usage/memtree/${OLD_ID}-v1-own`,
-    "expired cache is still returned without refreshing");
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 1);
-  lookup.peek("session-1");
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 2, "default peek refreshes after expiry");
-});
-
 test("a server without the endpoint is not asked again for a while", async () => {
   const { lookup, asked, clock } = scripted(() => 404);
   assert.equal(await lookup.settle("session-1"), undefined);

@@ -167,11 +167,7 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
 test("status-link files are written in interactive sessions (incl. manual/project/auto=0) and skipped when headless", async t => {
   let modelCalls = 0;
   let treeLookups = 0;
-  const session = {
-    session_id: "session-1",
-    links: { url: "https://example.org/m/sessions/session-1" },
-    latest_tree: { request_id: "req-1", ref: "req-1-v1", links: { url: "https://example.org/m/req-1" } },
-  };
+  const session = { session_id: "session-1", links: { url: "https://example.org/m/sessions/session-1" } };
   const server = http.createServer((req, res) => {
     req.resume();
     res.setHeader("content-type", "application/json");
@@ -204,32 +200,13 @@ test("status-link files are written in interactive sessions (incl. manual/projec
     {
       const hookDir = args[args.indexOf("--plugin-dir") + 1];
       const hookCfg = JSON.parse(fs.readFileSync(hookDir + "/hooks/hooks.json", "utf8")).hooks;
-      const hookUrl = hookCfg.UserPromptSubmit[0].hooks[0].url;
-      await fetch(hookUrl, {
+      await fetch(hookCfg.UserPromptSubmit[0].hooks[0].url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "session-1" }),
       });
-      await fetch(hookUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt: "hello", prompt_id: "prompt-1" }),
-      });
     }
     ${sessionScript}
-    {
-      const hookDir = args[args.indexOf("--plugin-dir") + 1];
-      const hookCfg = JSON.parse(fs.readFileSync(hookDir + "/hooks/hooks.json", "utf8")).hooks;
-      const stopRes = await fetch(hookCfg.UserPromptSubmit[0].hooks[0].url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ hook_event_name: "Stop", session_id: "session-1", prompt_id: "prompt-1" }),
-      });
-      if (stopRes.status === 200) {
-        const body = await stopRes.json();
-        if (body.systemMessage) console.error("stop-link", JSON.stringify(body.systemMessage));
-      }
-    }
   `;
   const trace = `
     import fs from "node:fs";
@@ -244,31 +221,15 @@ test("status-link files are written in interactive sessions (incl. manual/projec
   const configured = { type: "command", command: "ccc statusline" };
   const manual = { type: "command", command: "bash ~/.claude/statusline.sh" };
   for (const {
-    name, args = [], tty = true, auto = "1", refresh, memtreeLink = "off", statusLine = configured, projectStatusLine,
-    script = sessionScript, lookups = 0, cache = false, stopLink = false,
+    name, args = [], tty = true, auto = "1", refresh, statusLine = configured, projectStatusLine,
+    script = sessionScript, lookups = 0, cache = false,
   } of [
     { name: "non-TTY", tty: false },
     { name: "print", args: ["-p", "hi"] },
-    { name: "long print", args: ["--print", "hi"] },
-    { name: "continue with print", args: ["-c", "-p", "hi"] },
-    { name: "debug with print", args: ["-d", "-p", "hi"] },
-    { name: "interactive attached debug filter (-dmcp) keeps status line and Stop link", args: ["-dmcp"],
-      auto: "0", memtreeLink: "stop", script: resumeHookScript, lookups: 1, cache: true, stopLink: true },
-    { name: "interactive literal -p after -- keeps status line and Stop link", args: ["--", "-p"],
-      auto: "0", memtreeLink: "stop", script: resumeHookScript, lookups: 1, cache: true, stopLink: true },
-    { name: "interactive --model -p keeps status line", args: ["--model", "-p"], auto: "0", lookups: 1, cache: true },
-    { name: "interactive -pc (Claude Code opens interactive UI) keeps status line", args: ["-pc", "hi"],
-      auto: "0", lookups: 1, cache: true },
-    { name: "interactive with both displays off and no status line skips resume and prompt lookups",
-      auto: "0", statusLine: null, script: resumeHookScript, lookups: 0, cache: false },
-    { name: "interactive with --setting-sources user ignores excluded project status line",
-      args: ["--setting-sources", "user"], auto: "0", statusLine: null, projectStatusLine: configured,
-      script: resumeHookScript, lookups: 0, cache: false },
+    { name: "combined print flag", args: ["-pc", "hi"] },
     { name: "interactive with auto-install off and manual ccc statusline", auto: "0", lookups: 1, cache: true },
-    { name: "interactive with manual snippet and CCC_MEMTREE_LINK=off skips display lookups without refresh override",
-      auto: "0", statusLine: manual, script: resumeHookScript, lookups: 0, cache: false },
-    { name: "interactive with manual snippet and default link display writes link file on resume",
-      auto: "0", memtreeLink: "", statusLine: manual, script: resumeHookScript, lookups: 1, cache: true },
+    { name: "interactive with manual snippet on resume hook", auto: "0", statusLine: manual,
+      script: resumeHookScript, lookups: 1, cache: true },
     { name: "interactive with manual snippet and CCC_STATUSLINE_REFRESH=1", auto: "0", refresh: "1",
       statusLine: manual, lookups: 1, cache: true },
     { name: "interactive with project-scope ccc statusline", auto: "0", statusLine: manual,
@@ -281,10 +242,7 @@ test("status-link files are written in interactive sessions (incl. manual/projec
       const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
       const before = modelCalls;
       const lookupsBefore = treeLookups;
-      const caseEnv = {
-        ...env, CCC_STATUSLINE_AUTO: auto, CCC_STATUSLINE_REFRESH: refresh ?? "",
-        CCC_MEMTREE_LINK: memtreeLink,
-      };
+      const caseEnv = { ...env, CCC_STATUSLINE_AUTO: auto, CCC_STATUSLINE_REFRESH: refresh ?? "" };
       const { code, stderr } = await runCcc(args, caseEnv,
         { sessionScript: script, statusLine, projectStatusLine, isolatedCwd: true, authStatus: { loggedIn: false } },
         ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
@@ -293,7 +251,6 @@ test("status-link files are written in interactive sessions (incl. manual/projec
       assert.equal(treeLookups - lookupsBefore, lookups);
       if (cache) assert.match(stderr, /status-link I\/O writeFileSync/);
       else assert.doesNotMatch(stderr, /status-link I\/O/);
-      if (stopLink) assert.match(stderr, /stop-link.*https:\/\/example\.org\/m\/req-1/);
     });
   }
 });

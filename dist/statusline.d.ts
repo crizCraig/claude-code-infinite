@@ -48,10 +48,9 @@ export declare function processTree(pid: number | undefined): number[];
  */
 export declare function statusLineWantsLink(settingsFile?: string): boolean;
 /**
- * Whether the effective status line (`--settings`, then enabled sources from
- * project local -> project -> user) shows ccc's link.
+ * Whether the effective status line (project local -> project -> user) shows ccc's link.
  */
-export declare function effectiveStatusLineWantsLink(userSettings?: string, cwd?: string, claudeArgs?: readonly string[]): boolean;
+export declare function effectiveStatusLineWantsLink(userSettings?: string, cwd?: string): boolean;
 export interface StatusLinkConfig {
     /** Write `<config>/statusline/<session>.url` and check heartbeats on Stop. */
     enabled: boolean;
@@ -61,7 +60,7 @@ export interface StatusLinkConfig {
 /**
  * Decide status-line link file writing and per-request refresh for a session.
  * Interactive sessions always write the link file (for manual README snippets incl. Windows,
- * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Display-only lookups run
+ * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Per-request refreshes run
  * only when the effective status line is known to show the link or CCC_STATUSLINE_REFRESH=1.
  * Headless/non-interactive runs have no status line and do no status-link file work.
  */
@@ -70,6 +69,5 @@ export declare function resolveStatusLinkConfig(opts: {
     userSettings: string;
     cwd?: string;
     env?: NodeJS.ProcessEnv;
-    claudeArgs?: readonly string[];
 }): StatusLinkConfig;
 //# sourceMappingURL=statusline.d.ts.map

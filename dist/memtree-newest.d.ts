@@ -86,8 +86,8 @@ export declare class NewestTreeLookup {
     private notifyAnswered;
     /** Whether the server has answered for this session (a tree or its absence). */
     answered(sessionId: string): boolean;
-    /** The cached answer, refreshing in the background when stale (unless `refresh` is false). Never waits. */
-    peek(sessionId: string | undefined, refresh?: boolean): NewestTree | undefined;
+    /** The cached answer, refreshing in the background when stale. Never waits. */
+    peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
     settle(sessionId: string | undefined, waitMs?: number): Promise<NewestTree | undefined>;
     /**

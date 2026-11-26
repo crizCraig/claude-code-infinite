@@ -95,12 +95,12 @@ export class NewestTreeLookup {
     answered(sessionId) {
         return this.entries.get(sessionId)?.answered === true;
     }
-    /** The cached answer, refreshing in the background when stale (unless `refresh` is false). Never waits. */
-    peek(sessionId, refresh = true) {
+    /** The cached answer, refreshing in the background when stale. Never waits. */
+    peek(sessionId) {
         if (!sessionId || !SESSION_ID.test(sessionId))
             return undefined;
         const entry = this.entries.get(sessionId);
-        if (refresh && (!entry || this.now() - entry.fetchedAt >= this.ttlMs))
+        if (!entry || this.now() - entry.fetchedAt >= this.ttlMs)
             void this.refresh(sessionId);
         return entry?.tree;
     }

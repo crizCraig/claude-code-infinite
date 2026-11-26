@@ -11617,39 +11617,21 @@ test("with CCC_MEMTREE_LINK=off and no status line, model calls and hooks skip t
   assert.deepEqual(asked, ["session-2", "session-1", "session-3"]);
 });
 
-test("with CCC_MEMTREE_LINK=off and statusLinkRefresh=false, hooks/model calls skip lookups while compressions still write the link file and explicit memory ops keep lookups", async t => {
+test("with CCC_MEMTREE_LINK=off and a manual status line (statusLinkRefresh=false), raw model calls skip lookups while prompts/compressions still write the link file", async t => {
   const { readStatusLink } = await import("../dist/status-link.js");
-  const { NewestTreeLookup } = await import("../dist/memtree-newest.js");
-  const { SubagentMemoryHint } = await import("../dist/subagent-hint.js");
   const { dir, files } = statuslineFixture(t);
   let now = 1;
-  let blockLookup = true;
-  let releaseLookup;
-  const gate = new Promise(resolve => { releaseLookup = resolve; });
   const upstream = await mockUpstream();
   t.after(() => upstream.close());
-  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
-  t.after(() => memtreeSrv.close());
   const stable = "https://staging.example/m/sessions/session-1";
-  const asked = [];
-  const lookup = new NewestTreeLookup(async (p) => {
-    const q = new URL(p, "http://x").searchParams.get("q");
-    asked.push(q);
-    if (blockLookup) await gate;
-    return {
-      status: 200,
-      body: Buffer.from(JSON.stringify({
-        sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: `https://staging.example/m/sessions/${q}` } }],
-      })),
-    };
-  }, () => now);
+  const { lookup, asked } = await newestLookup(q => (
+    { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }), () => now);
   const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
     upstreamOrigin: upstream.origin, newestTrees: lookup, statusLinks: files,
     statusLinkRefresh: false, memtreeLinkPlacement: "off", statusLineSince: Date.now(),
-    subagentHint: new SubagentMemoryHint(),
   });
-  t.after(() => { releaseLookup(); proxy.close(); });
+  t.after(() => proxy.close());
 
   // Ordinary model calls at startup and after TTL expiry do not start lookups.
   await postSessionMessages(proxy.port, [{ role: "user", content: "hi" }]);
@@ -11659,59 +11641,13 @@ test("with CCC_MEMTREE_LINK=off and statusLinkRefresh=false, hooks/model calls s
   assert.equal(asked.length, 0);
   assert.equal(readStatusLink("session-1", dir), undefined);
 
-  // Resume (never stalling on a slow lookup), ordinary prompt, compression, and Stop start no lookup,
-  // while the page learned from compression is still written to the status-line link file.
-  const resumeStarted = Date.now();
-  assert.equal((await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" })).status, 204);
-  assert.ok(Date.now() - resumeStarted < 1_000, "resume hook must not wait for a tree-link lookup");
+  // Prompts still warm the lookup and write the status-line link file (P1 behavior preserved).
   await armMainTurn(proxy, "turn two", "prompt-1");
-  await postSessionMessages(proxy.port, followupTurn("turn two"));
-  assert.ok(memtreeSrv.calls.length >= 1);
-  assert.equal(readStatusLink("session-1", dir), PAGE_URL_1, "compression still writes its page to the link file");
-  const stop = await postHook(proxy, stopHook("prompt-1"));
-  assert.ok(stop.status === 204 || !JSON.stringify(stop.body).includes("/m/"));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(asked.length, 0);
-
-  // Explicit memory operations still run tree-link lookups (and update the link file when answered).
-  blockLookup = false;
-  releaseLookup();
-  assert.equal(await getCurrentId(proxy, "session-2"), `${NEWEST_REQUEST_ID}-v3-own`);
-  assert.deepEqual(asked, ["session-2"]);
-
-  const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
-  assert.equal(view.status, 200);
-  assert.ok(stripAnsi(view.body.reason).includes(NEWEST_URL));
-  assert.deepEqual(asked, ["session-2", "session-1"]);
+  for (let i = 0; i < 50 && readStatusLink("session-1", dir) !== stable; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(asked.length, 1);
   assert.equal(readStatusLink("session-1", dir), stable);
-
-  const subagent = await postHook(proxy, { hook_event_name: "SubagentStart", session_id: "session-3", agent_id: "agent-1" });
-  assert.equal(subagent.status, 200);
-  assert.ok(subagent.body.hookSpecificOutput.additionalContext.includes(`${NEWEST_REQUEST_ID}-v3-own`));
-  assert.deepEqual(asked, ["session-2", "session-1", "session-3"]);
-});
-
-test("with CCC_MEMTREE_LINK=off and statusLinkRefresh=true, resume and prompts still warm the status-line link", async t => {
-  const { readStatusLink } = await import("../dist/status-link.js");
-  const { dir, files } = statuslineFixture(t);
-  const upstream = await mockUpstream();
-  t.after(() => upstream.close());
-  const stable = "https://staging.example/m/sessions/session-1";
-  const { lookup, asked } = await newestLookup(q => (
-    { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
-    upstreamOrigin: upstream.origin, newestTrees: lookup, statusLinks: files,
-    statusLinkRefresh: true, memtreeLinkPlacement: "off", statusLineSince: Date.now(),
-  });
-  t.after(() => proxy.close());
-
-  assert.equal((await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" })).status, 204);
-  assert.deepEqual(asked, ["session-1"]);
-  assert.equal(readStatusLink("session-1", dir), stable);
-  assert.equal((await postHook(proxy, { hook_event_name: "UserPromptSubmit", session_id: "session-2", prompt: "hi", prompt_id: "p2" })).status, 204);
-  for (let i = 0; i < 50 && asked.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.deepEqual(asked, ["session-1", "session-2"]);
 });
 
 test("the status line links the session's stable page once the server names one", async () => {
