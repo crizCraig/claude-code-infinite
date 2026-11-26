@@ -152,10 +152,11 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.doesNotMatch(stderr, /\x1b\[/);
 });
 
-test("model calls use status-link files only for an enabled, configured interactive status line", async t => {
+test("status-link files and refreshes match v1.0.38, including manual snippets and --bare", async t => {
   let modelCalls = 0;
   let treeLookups = 0;
-  const session = { session_id: "session-1", links: { url: "https://example.org/m/sessions/session-1" } };
+  const sessionUrl = "https://example.org/m/sessions/session-1";
+  const session = { session_id: "session-1", links: { url: sessionUrl } };
   const server = http.createServer((req, res) => {
     req.resume();
     res.setHeader("content-type", "application/json");
@@ -174,7 +175,7 @@ test("model calls use status-link files only for an enabled, configured interact
   const origin = `http://127.0.0.1:${server.address().port}`;
   const env = { CCC_LOCAL_BASE_URL: origin, CCC_ANTHROPIC_UPSTREAM: origin, CCC_HTTPS_PROXY_MODE: "0",
     CCC_MEMTREE_MCP: "0", CCC_MEMTREE_LINK: "off" };
-  const sessionScript = `
+  const messagesScript = `
     for (let i = 0; i < 3; i++) {
       const reply = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {
         method: "POST",
@@ -184,37 +185,58 @@ test("model calls use status-link files only for an enabled, configured interact
       if ((await reply.json()).content[0].text !== "ok") throw Error("unexpected model reply");
     }
   `;
-  const trace = `
-    import fs from "node:fs";
-    for (const op of ["readFileSync", "writeFileSync", "renameSync", "unlinkSync", "statSync"]) {
-      const original = fs[op];
-      fs[op] = function(file, ...args) {
-        if (/session-1[.](url|heartbeat)/.test(String(file))) console.error("status-link I/O", op, file);
-        return original.call(this, file, ...args);
-      };
+  const resumeAndMessagesScript = `
+    {
+      const hookDir = args[args.indexOf("--plugin-dir") + 1];
+      const hookCfg = JSON.parse(fs.readFileSync(hookDir + "/hooks/hooks.json", "utf8")).hooks;
+      await fetch(hookCfg.UserPromptSubmit[0].hooks[0].url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "session-1" }),
+      });
+    }
+    ${messagesScript}
+  `;
+  const readLinkScript = (wait) => `
+    const linkFile = (process.env.HOME || process.env.USERPROFILE) + "/.claude-code-infinite/statusline/session-1.url";
+    ${wait ? `for (let i = 0; i < 100 && !fs.existsSync(linkFile); i++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }` : ""}
+    if (fs.existsSync(linkFile)) {
+      console.error("status-link-file", fs.readFileSync(linkFile, "utf8").trim());
     }
   `;
   const configured = { type: "command", command: "ccc statusline" };
-  for (const { name, args = [], tty = true, auto = "1", statusLine = configured, cache = false } of [
-    { name: "non-TTY", tty: false },
-    { name: "print", args: ["-p", "hi"] },
-    { name: "combined print flag", args: ["-pc", "hi"] },
-    { name: "interactive with auto-install off", auto: "0" },
-    { name: "interactive with an unsupported status line", statusLine: { type: "unsupported" } },
-    { name: "interactive with ccc configured", cache: true },
+  const readmeInline = {
+    type: "command",
+    command: 'link=$(cat ~/.claude-code-infinite/statusline/"$(echo "$input" | jq -r .session_id)".url 2>/dev/null); [ -n "$link" ] && printf "%s" "$link"',
+  };
+  const manualScript = { type: "command", command: "bash ~/.claude/statusline.sh" };
+  for (const {
+    name, args = [], auto = "0", refresh = "", statusLine = configured,
+    script = messagesScript, lookups = 1, expectLink = true,
+  } of [
+    { name: "ccc statusline configured normally", auto: "1" },
+    { name: "ccc statusline with CCC_STATUSLINE_AUTO=0" },
+    { name: "ccc statusline under --bare", args: ["--bare"], auto: "1" },
+    { name: "manual README inline snippet", statusLine: readmeInline },
+    { name: "manual script writes link file on resume hook", statusLine: manualScript, script: resumeAndMessagesScript },
+    { name: "manual script with CCC_STATUSLINE_REFRESH=1 refreshes on model calls", statusLine: manualScript, refresh: "1" },
+    { name: "manual script without CCC_STATUSLINE_REFRESH=1 skips per-request refresh", statusLine: manualScript, lookups: 0, expectLink: false },
   ]) {
     await t.test(name, async () => {
-      const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
+      const preload = "process.stdin.isTTY = process.stdout.isTTY = true;";
       const before = modelCalls;
       const lookupsBefore = treeLookups;
-      const { code, stderr } = await runCcc(args, { ...env, CCC_STATUSLINE_AUTO: auto },
-        { sessionScript, statusLine, authStatus: { loggedIn: false } },
+      const { code, stderr } = await runCcc(args,
+        { ...env, CCC_STATUSLINE_AUTO: auto, CCC_STATUSLINE_REFRESH: refresh },
+        { sessionScript: script + readLinkScript(expectLink), statusLine, authStatus: { loggedIn: false } },
         ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
       assert.equal(code, 0, stderr);
       assert.equal(modelCalls - before, 3);
-      assert.equal(treeLookups - lookupsBefore, 1, "the background lookup still runs");
-      if (cache) assert.match(stderr, /status-link I\/O writeFileSync/);
-      else assert.doesNotMatch(stderr, /status-link I\/O/);
+      assert.equal(treeLookups - lookupsBefore, lookups);
+      if (expectLink) assert.match(stderr, /status-link-file https:\/\/example\.org\/m\/sessions\/session-1/);
+      else assert.doesNotMatch(stderr, /status-link-file/);
     });
   }
 });

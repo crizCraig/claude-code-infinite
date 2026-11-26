@@ -44,7 +44,8 @@ export declare function runWrapped(command: string, input: string, timeoutMs?: n
 /** `pid` and every descendant (from `ps`; just `pid` where there is none, e.g. Windows). */
 export declare function processTree(pid: number | undefined): number[];
 /**
- * Whether auto-install should preserve a command that already includes ccc's link.
+ * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
+ * only then does the proxy keep the link fresh in the background. Read at startup.
  */
 export declare function statusLineWantsLink(settingsFile?: string): boolean;
 //# sourceMappingURL=statusline.d.ts.map

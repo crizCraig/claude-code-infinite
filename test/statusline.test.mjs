@@ -186,7 +186,7 @@ test("each Claude config dir saves its own original", () => {
   assert.notEqual(a.saved, statuslinePaths({}).saved);
 });
 
-test("auto-install recognizes commands that already include the status link", () => {
+test("the proxy refreshes per request only for a status line that shows the link", () => {
   const check = (command) => {
     const { paths } = setup(command ? { type: "command", command } : undefined);
     return statusLineWantsLink(paths.settings);

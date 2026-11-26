@@ -9,6 +9,7 @@ import path from "node:path";
 import {
   MEMTREE_ALLOWED_TOOLS,
   disallowedMemtreeTools,
+  formatDirectMcpConfig,
   memtreeServerInArgs,
   planMemtreeMcp,
   withMemtreeMcpArgs,
@@ -130,4 +131,53 @@ test("the last memtree definition wins, as in Claude Code; only ccc's own server
   assert.equal(memtreeServerInArgs([`--mcp-config=${ccc}`, `--mcp-config=${foreign}`]), "other");
   assert.equal(memtreeServerInArgs([`--mcp-config=${foreign}`, `--mcp-config=${ccc}`]), "ccc");
   assert.equal(memtreeServerInArgs(["-p", "q"]), "none");
+});
+
+test("direct-mode memtree registrations omit x-memtree-tools so compression never advertises current-tree reads", () => {
+  const prodJson = formatDirectMcpConfig("json", "/opt/homebrew/bin/node", "/app/dist/cli.js", "production");
+  const stagingJson = formatDirectMcpConfig("json", "/opt/homebrew/bin/node", "/app/dist/cli.js", "staging");
+  const winJson = formatDirectMcpConfig(
+    "json",
+    String.raw`C:\Program Files\nodejs\node.exe`,
+    String.raw`C:\Users\Alex\dist\cli.js`,
+    "production"
+  );
+  const directShort = JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["memtree-mcp", "--direct"] } } });
+  const directScript = JSON.stringify({ mcpServers: { memtree: { command: "node", args: ["/x/dist/memtree-mcp.js", "--direct"] } } });
+  const directWinScript = JSON.stringify({
+    mcpServers: { memtree: { command: "node.exe", args: [String.raw`C:\app\dist\memtree-mcp.js`, "--env", "staging", "--direct"] } },
+  });
+  const proxy = JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["memtree-mcp"] } } });
+  const afterSeparator = JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["memtree-mcp", "--", "--direct"] } } });
+  const printConfig = JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["memtree-mcp", "--print-config", "--format", "json"] } } });
+
+  for (const cfg of [prodJson, stagingJson, winJson, directShort, directScript, directWinScript]) {
+    assert.equal(memtreeServerInArgs([`--mcp-config=${cfg}`]), "ccc-direct", cfg);
+    assert.deepEqual(planMemtreeMcp(["-p", "q", `--mcp-config=${cfg}`], {}), { register: false, tools: [] }, cfg);
+    assert.deepEqual(planMemtreeMcp(["-p", "q", `--mcp-config=${cfg}`], { CCC_MEMTREE_MCP: "0" }),
+      { register: false, tools: [] }, cfg);
+  }
+
+  withConfigDir((dir) => {
+    const directFile = path.join(dir, "direct.json");
+    fs.writeFileSync(directFile, prodJson);
+    assert.equal(memtreeServerInArgs(["--mcp-config", directFile]), "ccc-direct");
+    assert.deepEqual(planMemtreeMcp(["--mcp-config", directFile, "hi"], {}), { register: false, tools: [] });
+  });
+
+  // `--direct` after `--` is not a direct-mode option (matches runMemtreeMcpServer).
+  assert.equal(memtreeServerInArgs([`--mcp-config=${afterSeparator}`]), "ccc");
+  assert.deepEqual(planMemtreeMcp([`--mcp-config=${afterSeparator}`], {}), { register: false, tools: ALL });
+
+  // `--print-config` exits rather than serving MCP.
+  assert.equal(memtreeServerInArgs([`--mcp-config=${printConfig}`]), "other");
+  assert.deepEqual(planMemtreeMcp([`--mcp-config=${printConfig}`], {}), { register: false, tools: [] });
+
+  // Last definition wins across proxy and direct configs.
+  assert.equal(memtreeServerInArgs([`--mcp-config=${proxy}`, `--mcp-config=${prodJson}`]), "ccc-direct");
+  assert.deepEqual(planMemtreeMcp([`--mcp-config=${proxy}`, `--mcp-config=${prodJson}`], {}),
+    { register: false, tools: [] });
+  assert.equal(memtreeServerInArgs([`--mcp-config=${prodJson}`, `--mcp-config=${proxy}`]), "ccc");
+  assert.deepEqual(planMemtreeMcp([`--mcp-config=${prodJson}`, `--mcp-config=${proxy}`], {}),
+    { register: false, tools: ALL });
 });

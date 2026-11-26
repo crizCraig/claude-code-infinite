@@ -25,8 +25,10 @@
  * - The caller's choices win (planMemtreeMcp): `CCC_MEMTREE_MCP=0` turns it
  *   off; a caller's own `--mcp-config` server named `memtree` (or a config
  *   ccc cannot read, which might define one) is kept and ccc adds and
- *   pre-allows nothing (if it runs `ccc memtree-mcp` the header is still
- *   sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
+ *   pre-allows nothing (if it runs proxy-mode `ccc memtree-mcp` the header is
+ *   still sent; if it runs `--direct`, which has no session "current" tree,
+ *   the header is omitted so compression never advertises current-tree reads);
+ *   tools named by `--disallowedTools` (a tool, `mcp__memtree`,
  *   or a `*` pattern) are neither pre-allowed nor named in the header, and
  *   with all of them disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
@@ -234,22 +236,24 @@ export function mcpConfigArgs(args: readonly string[]): string[] {
 /**
  * The server named `memtree` in the argv's `--mcp-config` values, judged by
  * the last value that defines one (Claude Code keeps the last definition of
- * a name): "ccc" when it runs `memtree-mcp` (`ccc memtree-mcp`, `ccc staging
- * memtree-mcp`, or dist/memtree-mcp.js), "other" for someone else's, and
- * "unknown" when a value ccc cannot read or parse comes after it (it may
- * define one), "none" otherwise. Only `--mcp-config` can override ccc's
- * server: it beats a project `.mcp.json` server of the same name (checked on
- * Claude Code 2.1.302), and plugin servers get `plugin_…` names.
+ * a name): "ccc" when it runs proxy-mode `memtree-mcp` (`ccc memtree-mcp`,
+ * `ccc staging memtree-mcp`, or dist/memtree-mcp.js), "ccc-direct" when it
+ * runs `memtree-mcp --direct` (which has no current tree, so compression must
+ * not advertise current-tree reads), "other" for someone else's, "unknown"
+ * when a value ccc cannot read or parse comes after it (it may define one),
+ * and "none" otherwise. Only `--mcp-config` can override ccc's server: it
+ * beats a project `.mcp.json` server of the same name (checked on Claude Code
+ * 2.1.302), and plugin servers get `plugin_…` names.
  */
 export function memtreeServerInArgs(
   args: readonly string[],
   cwd: string = process.cwd()
-): "ccc" | "other" | "unknown" | "none" {
-  let found: "ccc" | "other" | "unknown" | "none" = "none";
+): "ccc" | "ccc-direct" | "other" | "unknown" | "none" {
+  let found: "ccc" | "ccc-direct" | "other" | "unknown" | "none" = "none";
   for (const value of mcpConfigArgs(args)) {
     const server = memtreeServerIn(value, cwd);
     if (server === null) continue;
-    found = server === undefined ? "unknown" : isCccMemtreeServer(server) ? "ccc" : "other";
+    found = server === undefined ? "unknown" : classifyMemtreeServer(server);
   }
   return found;
 }
@@ -292,12 +296,33 @@ function memtreeServerIn(value: string, cwd: string): object | null | undefined 
   return server && typeof server === "object" ? server : undefined;
 }
 
-/** A command line whose program or an argument is `memtree-mcp` or a memtree-mcp.js path. */
-function isCccMemtreeServer(server: { command?: unknown; args?: unknown }): boolean {
+function basenameAny(filePath: string): string {
+  const parts = filePath.split(/[/\\]/);
+  return parts[parts.length - 1] ?? "";
+}
+
+/**
+ * Classify a `memtree` server entry:
+ * - "ccc": runs ccc's proxy-mode `memtree-mcp` (has this session's current tree).
+ * - "ccc-direct": runs `memtree-mcp --direct` (no current tree; omit `x-memtree-tools`).
+ * - "other": anything else (non-stdio, another server, or `--print-config`).
+ */
+function classifyMemtreeServer(
+  server: { type?: unknown; command?: unknown; args?: unknown }
+): "ccc" | "ccc-direct" | "other" {
+  if (server.type !== undefined && server.type !== "stdio") return "other";
   const parts = [server.command, ...(Array.isArray(server.args) ? server.args : [])];
-  return parts.some(
-    (part) => typeof part === "string" && /^memtree-mcp(\.js)?$/.test(path.basename(part))
+  const index = parts.findIndex(
+    (part) => typeof part === "string" && /^memtree-mcp(\.js)?$/.test(basenameAny(part))
   );
+  if (index < 0 || parts.slice(1, index).includes("--")) return "other";
+  const tail = parts.slice(index + 1);
+  if (tail[0] === "--print-config" && basenameAny(parts[index] as string) === "memtree-mcp") {
+    return "other";
+  }
+  const endOptions = tail.indexOf("--");
+  const optionArgs = endOptions < 0 ? tail : tail.slice(0, endOptions);
+  return optionArgs.includes("--direct") ? "ccc-direct" : "ccc";
 }
 
 function memtreeToolName(tool: string): string {

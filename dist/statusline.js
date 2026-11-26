@@ -370,7 +370,8 @@ function backup(file) {
     fs.chmodSync(copy, fileMode(realTarget(file)) ?? 0o600);
 }
 /**
- * Whether auto-install should preserve a command that already includes ccc's link.
+ * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
+ * only then does the proxy keep the link fresh in the background. Read at startup.
  */
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings) {
     const command = (readJson(settingsFile)
