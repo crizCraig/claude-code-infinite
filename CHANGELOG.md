@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.0.39](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.38...v1.0.39) (2026-11-26)
+
+
+### Features
+
+* read MemTree from standalone MCP clients ([#92](https://github.com/crizCraig/claude-code-infinite/issues/92)) ([a121096](https://github.com/crizCraig/claude-code-infinite/commit/a12109657193e63eeb2fe05beeea41b13c904add))
+
+
+### Bug Fixes
+
+* 1.0.39 release-review fixes (Yarn Berry postinstall, status-line link for all users, direct-mode tools, no lookups when links are off) ([df24071](https://github.com/crizCraig/claude-code-infinite/commit/df24071253c75d4be3cae5f8ab32d7dbf2cca049))
+* gate display tree-link lookups on effective status-line config ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96)) ([601777f](https://github.com/crizCraig/claude-code-infinite/commit/601777f2e9cb311e73e12159de96fbfa69fceabe))
+* gate MemTree browser links and confirm fallback checkout ([#93](https://github.com/crizCraig/claude-code-infinite/issues/93)) ([a32dd52](https://github.com/crizCraig/claude-code-infinite/commit/a32dd5262d3d4f929ccffd94d8e5ffca684e0e74))
+* keep writing status-line link files for all interactive setups and omit Stop link only on heartbeat ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96)) ([42a28ea](https://github.com/crizCraig/claude-code-infinite/commit/42a28ea3d2241e8fc57b003e69d60a1419e534ae))
+* omit x-memtree-tools when caller registers direct-mode MemTree MCP ([#92](https://github.com/crizCraig/claude-code-infinite/issues/92)) ([993972d](https://github.com/crizCraig/claude-code-infinite/commit/993972d8dcf0c07ff63d3d7b9aeb97de6587b305))
+* preserve fitting history when the token count fails ([#97](https://github.com/crizCraig/claude-code-infinite/issues/97)) ([d3f2f87](https://github.com/crizCraig/claude-code-infinite/commit/d3f2f877003246b5f5c9fb443e07c40dddb8ff8f))
+* restore v1.0.38 status-link and lookup behavior, keeping Stop heartbeat suppression ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96)) ([f7b44b6](https://github.com/crizCraig/claude-code-infinite/commit/f7b44b669ab6d79984fecfe34010ac27bc6bb8ab))
+* run postinstall without ENOEXEC under Yarn Berry while keeping Windows absolute Node ([#91](https://github.com/crizCraig/claude-code-infinite/issues/91)) ([6394f85](https://github.com/crizCraig/claude-code-infinite/commit/6394f852c804158f545304aac721cb58c21caf18))
+* search guidance makes hybrid the mode for finding things, text for known exact words ([2f6d5ab](https://github.com/crizCraig/claude-code-infinite/commit/2f6d5abb98721f11cbb900a0ebf9c4142ac8e052))
+* skip tree-link lookups when both link displays are off ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96)) ([ae395d6](https://github.com/crizCraig/claude-code-infinite/commit/ae395d65614c0bc03ae4b0cf24288660df9037e9))
+* startup banner names Claude Code Infinite first ("∞ Claude Code Infinite · MemTree memory on") ([#89](https://github.com/crizCraig/claude-code-infinite/issues/89)) ([a6c2582](https://github.com/crizCraig/claude-code-infinite/commit/a6c25820bf9184e27af4ec8d2b4e4f04914886d5))
+* startup security: no bare-name spawns on Windows; typed-ahead text never becomes an API key ([#91](https://github.com/crizCraig/claude-code-infinite/issues/91)) ([e8cbd37](https://github.com/crizCraig/claude-code-infinite/commit/e8cbd376ee1423deccb84f339d0fa77735b2ba00))
+* use argument-aware print detection for interactive link displays ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96)) ([5e94b8f](https://github.com/crizCraig/claude-code-infinite/commit/5e94b8f0ca1495d17bd4d8aa86778d624cbdc033))
+
 ## [1.0.38](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.37...v1.0.38) (2026-11-15)
 
 
