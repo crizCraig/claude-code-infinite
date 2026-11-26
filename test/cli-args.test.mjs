@@ -27,13 +27,68 @@ test("unrecognized flags pass through to Claude untouched", () => {
   assert.deepEqual(parseWrapperArgs([]), { claudeArgs: [], debug: false });
 });
 
-test("Claude print flags are recognized only before --", () => {
-  assert.equal(isPrintInvocation(["-p", "hello"]), true);
-  assert.equal(isPrintInvocation(["--print", "hello"]), true);
-  assert.equal(isPrintInvocation(["-p", "--", "--print"]), true);
-  assert.equal(isPrintInvocation(["--", "-p"]), false);
-  assert.equal(isPrintInvocation(["--", "--print"]), false);
-  assert.equal(isPrintInvocation(["hello", "--", "--print"]), false);
+test("Claude print flags are recognized only before -- and not as option values", () => {
+  for (const args of [
+    ["-p"],
+    ["-p", "hello"],
+    ["--print"],
+    ["--print", "hello"],
+    ["-p", "--", "--print"],
+    ["-c", "-p", "hi"],
+    ["-p", "-c", "hi"],
+    ["-d", "-p", "hi"],
+    ["--debug", "-p", "hi"],
+    ["-d", "mcp", "-p", "hi"],
+    ["-dn", "-p", "hi"],
+    ["-r", "-p", "hi"],
+    ["--resume", "abc", "-p", "hi"],
+    ["--model", "opus", "-p", "hi"],
+    ["--model=opus", "-p", "hi"],
+    ["--allowedTools", "Bash", "-p", "hi"],
+    ["--add-dir", "/tmp", "-p", "hi"],
+    ["hello", "-p"],
+  ]) {
+    assert.equal(isPrintInvocation(args), true, args.join(" "));
+  }
+  for (const args of [
+    [],
+    ["--", "-p"],
+    ["--", "--print"],
+    ["hello", "--", "-p"],
+    ["hello", "--", "--print"],
+    ["-d", "--", "-p", "hi"],
+    ["--append-system-prompt", "--", "-p"],
+    ["-dmcp"],
+    ["-dpc"],
+    ["-pc", "hi"],
+    ["-cp", "hi"],
+    ["-pr1234"],
+    ["-pdapi,http"],
+    ["-rp"],
+    ["-np"],
+    ["-wp"],
+    ["--print=true", "hi"],
+    ["--model", "-p"],
+    ["--model", "--print"],
+    ["-n", "-p"],
+    ["--name", "-p"],
+    ["-cn", "-p"],
+    ["--system-prompt", "-p"],
+    ["--append-system-prompt", "-p"],
+    ["--effort", "-p"],
+    ["--plugin-dir", "-p"],
+    ["--fallback-model", "-p"],
+    ["--debug-file", "-p"],
+    ["--allowedTools", "-p"],
+    ["--disallowedTools", "-p"],
+    ["--add-dir", "-p"],
+    ["--betas", "-p"],
+    ["--tools", "-p"],
+    ["--settings", "-p"],
+    ["--setting-sources", "-p"],
+  ]) {
+    assert.equal(isPrintInvocation(args), false, args.join(" "));
+  }
 });
 
 test("mayBePrintInvocation also counts combined short flags with p (no browser opened)", () => {

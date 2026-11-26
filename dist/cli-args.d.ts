@@ -3,8 +3,15 @@ export interface WrapperArgs {
     claudeArgs: string[];
     debug: boolean;
 }
-/** Whether Claude's own print mode was requested before its `--` separator. */
-export declare function isPrintInvocation(args: string[]): boolean;
+/** Whether `arg` is a Claude Code option that consumes the next argv element as its value. */
+export declare function takesRequiredOptionValue(arg: string): boolean;
+/**
+ * Whether Claude's own print mode (`-p` / `--print`) was requested before `--`.
+ * Argument-aware and conservative: option values (e.g. `--model -p`, `-n -p`),
+ * attached short-flag values or clusters (`-dmcp`, `-pc`), and anything after `--`
+ * are not treated as print mode (matching Claude Code opening its interactive UI).
+ */
+export declare function isPrintInvocation(args: readonly string[]): boolean;
 /**
  * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
  * cluster with p among its leading letters (`-pc`, `-cp`, `-pr<id>`) or
