@@ -158,36 +158,6 @@ test("invalidate drops an in-flight answer that may predate a new compress page"
   assert.equal(lookup.peek("session-1").url, NEW_URL, "the overtaken answer is not stored");
 });
 
-test("invalidate with refresh=false drops cached and in-flight answers without starting a lookup", async () => {
-  let release;
-  const gate = new Promise((r) => (release = r));
-  const trees = [OLD_ID, NEW_ID];
-  const { lookup, asked } = scripted(async (q, call) => {
-    if (call === 0) await gate;
-    return { sessions: [item(q, trees[call])] };
-  });
-  // Nothing cached or in flight: invalidating without refresh starts no request.
-  lookup.invalidate("session-1", false);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 0);
-
-  // In-flight answer invalidated without refresh is dropped, with no background refetch.
-  const waiting = lookup.current("session-1");
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 1);
-  lookup.invalidate("session-1", false);
-  release();
-  // An explicit current() caller still receives the replacement tree.
-  assert.deepEqual(await waiting, { tree: { url: NEW_URL, key: `${NEW_ID}-v1-own` }, answered: true });
-  assert.equal(asked.length, 2);
-
-  // Cached answer invalidated without refresh is cleared without starting a lookup.
-  lookup.invalidate("session-1", false);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.length, 2);
-  assert.equal(lookup.answered("session-1"), false);
-});
-
 test("finder URLs retain their pinned namespace and served/own selection", () => {
   for (const suffix of ["v1-own", "v3-served"]) {
     const row = item("session-1", NEW_ID);

@@ -129,11 +129,9 @@ export class NewestTreeLookup {
      * is kept. Waits at most twice `waitMs` (once more after an invalidation).
      */
     async current(sessionId, waitMs = NEWEST_TREE_CURRENT_WAIT_MS) {
-        this.peek(sessionId);
-        const flight = this.inFlight.get(sessionId);
         await this.settle(sessionId, waitMs);
-        // A newer page invalidated the lookup it waited on: wait for (or start) its replacement.
-        if (!this.entries.has(sessionId) && (flight?.dirty || this.inFlight.has(sessionId))) {
+        // A newer page invalidated the lookup it waited on: wait for its replacement.
+        if (!this.entries.has(sessionId) && this.inFlight.has(sessionId)) {
             await this.settle(sessionId, waitMs);
         }
         const entry = this.entries.get(sessionId);
@@ -144,22 +142,16 @@ export class NewestTreeLookup {
         return { answered: entry.answered && this.now() - entry.fetchedAt < this.ttlMs };
     }
     /**
-     * Forget a session's answer: a newer compress page just arrived, so a cached
-     * or in-flight answer may predate it. With `refresh` (default true), starts a
-     * replacement lookup in the background; with `refresh = false`, drops stale
-     * state without issuing a server request until a caller asks.
+     * Forget a session's answer and ask again: a newer compress page just
+     * arrived, so a cached or in-flight answer may predate it.
      */
-    invalidate(sessionId, refresh = true) {
+    invalidate(sessionId) {
         this.entries.delete(sessionId);
         const running = this.inFlight.get(sessionId);
-        if (running) {
+        if (running)
             running.dirty = true;
-            if (refresh)
-                running.refetch = true;
-        }
-        else if (refresh) {
+        else
             this.peek(sessionId);
-        }
     }
     refresh(sessionId) {
         const running = this.inFlight.get(sessionId);
@@ -171,18 +163,13 @@ export class NewestTreeLookup {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.fetchTimeoutMs);
         timer.unref();
-        const flight = {
-            promise: Promise.resolve(undefined),
-            dirty: false,
-            refetch: false,
-        };
+        const flight = { promise: Promise.resolve(undefined), dirty: false };
         flight.promise = this.ask(sessionId, controller.signal).then((entry) => {
             clearTimeout(timer);
             this.inFlight.delete(sessionId);
             // Coalesce all invalidations during this lookup into one replacement.
             if (flight.dirty) {
-                if (flight.refetch)
-                    this.peek(sessionId);
+                this.peek(sessionId);
                 return undefined;
             }
             if (entry)
