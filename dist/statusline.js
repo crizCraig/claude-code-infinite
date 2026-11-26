@@ -16,6 +16,7 @@
  */
 import { executablePath } from "./executable-path.js";
 import { system32Path, windowsShellEnv } from "./claude-locate.js";
+import { takesRequiredOptionValue } from "./cli-args.js";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -369,8 +370,7 @@ function backup(file) {
     fs.copyFileSync(file, copy);
     fs.chmodSync(copy, fileMode(realTarget(file)) ?? 0o600);
 }
-function statusLineFromSettings(file) {
-    const parsed = readJson(file);
+function statusLineFromObject(parsed) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
         return { found: false };
     if (!Object.prototype.hasOwnProperty.call(parsed, "statusLine"))
@@ -380,6 +380,56 @@ function statusLineFromSettings(file) {
         found: true,
         command: statusLine && typeof statusLine === "object" ? statusLine.command : undefined,
     };
+}
+function statusLineFromSettings(file) {
+    return statusLineFromObject(readJson(file));
+}
+function statusLineFromSettingsArg(value, cwd) {
+    const trimmed = value.trim();
+    if (!trimmed)
+        return { found: false };
+    if (trimmed.startsWith("{")) {
+        try {
+            return statusLineFromObject(JSON.parse(trimmed.replace(/^\uFEFF/, "")));
+        }
+        catch {
+            return { found: false };
+        }
+    }
+    return statusLineFromSettings(path.resolve(cwd, trimmed));
+}
+function parseSettingsCliOptions(args) {
+    let settings;
+    let settingSources;
+    let ignoreFileSources = false;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === "--")
+            break;
+        if (arg === "--settings") {
+            if (i + 1 < args.length)
+                settings = args[++i];
+        }
+        else if (arg.startsWith("--settings=")) {
+            settings = arg.slice("--settings=".length);
+        }
+        else if (arg === "--setting-sources") {
+            if (i + 1 < args.length)
+                settingSources = args[++i];
+        }
+        else if (arg.startsWith("--setting-sources=")) {
+            settingSources = arg.slice("--setting-sources=".length);
+        }
+        else if (arg === "--bare" || arg === "--restricted") {
+            ignoreFileSources = true;
+        }
+        else if (takesRequiredOptionValue(arg)) {
+            if (args[i + 1] === "--")
+                break;
+            i++;
+        }
+    }
+    return { settings, settingSources, ignoreFileSources };
 }
 function commandWantsLink(command) {
     return typeof command === "string" && (CCC_STATUSLINE.test(command) ||
@@ -393,14 +443,29 @@ export function statusLineWantsLink(settingsFile = statuslinePaths().settings) {
     return commandWantsLink(statusLineFromSettings(settingsFile).command);
 }
 /**
- * Whether the effective status line (project local -> project -> user) shows ccc's link.
+ * Whether the effective status line (`--settings`, then enabled sources from
+ * project local -> project -> user) shows ccc's link.
  */
-export function effectiveStatusLineWantsLink(userSettings = statuslinePaths().settings, cwd = process.cwd()) {
-    for (const file of [
-        path.join(cwd, ".claude", "settings.local.json"),
-        path.join(cwd, ".claude", "settings.json"),
-        userSettings,
-    ]) {
+export function effectiveStatusLineWantsLink(userSettings = statuslinePaths().settings, cwd = process.cwd(), claudeArgs = []) {
+    const cli = parseSettingsCliOptions(claudeArgs);
+    if (cli.settings !== undefined) {
+        const entry = statusLineFromSettingsArg(cli.settings, cwd);
+        if (entry.found)
+            return commandWantsLink(entry.command);
+    }
+    const sources = cli.ignoreFileSources
+        ? new Set()
+        : cli.settingSources !== undefined
+            ? new Set(cli.settingSources.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean))
+            : new Set(["local", "project", "user"]);
+    const candidates = [
+        ["local", path.join(cwd, ".claude", "settings.local.json")],
+        ["project", path.join(cwd, ".claude", "settings.json")],
+        ["user", userSettings],
+    ];
+    for (const [source, file] of candidates) {
+        if (!sources.has(source))
+            continue;
         const entry = statusLineFromSettings(file);
         if (entry.found)
             return commandWantsLink(entry.command);
@@ -410,7 +475,7 @@ export function effectiveStatusLineWantsLink(userSettings = statuslinePaths().se
 /**
  * Decide status-line link file writing and per-request refresh for a session.
  * Interactive sessions always write the link file (for manual README snippets incl. Windows,
- * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Per-request refreshes run
+ * CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines). Display-only lookups run
  * only when the effective status line is known to show the link or CCC_STATUSLINE_REFRESH=1.
  * Headless/non-interactive runs have no status line and do no status-link file work.
  */
@@ -419,7 +484,7 @@ export function resolveStatusLinkConfig(opts) {
         return { enabled: false, refresh: false };
     const env = opts.env ?? process.env;
     const refresh = env.CCC_STATUSLINE_REFRESH === "1" ||
-        effectiveStatusLineWantsLink(opts.userSettings, opts.cwd);
+        effectiveStatusLineWantsLink(opts.userSettings, opts.cwd, opts.claudeArgs);
     return { enabled: true, refresh };
 }
 function writeStdout(text) {

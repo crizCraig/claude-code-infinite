@@ -2161,13 +2161,14 @@ async function handleNoticeHook(
   let statusLineShows: ((url: string) => boolean) | undefined;
   const { statusLineSince, statusLinks } = state;
   if (stopMatchesMainPrompt && statusLineSince !== undefined && statusLinks) {
-    // Refresh the status line even when Stop has no trailer. A Stop trailer's own
-    // link resolver already refreshes the lookup when it needs a link.
-    if (state.memtreeLinkPlacement === "off" &&
-        (state.stableSessionLinks.has(parsed.session_id) || state.newestTrees?.sessionUrl(parsed.session_id))) {
-      publishStatusLink(state, parsed.session_id);
-    } else {
-      state.newestTrees?.peek(parsed.session_id);
+    // Refresh the status line even when Stop has no trailer, only when a display actively consumes it.
+    if (hasLinkDisplay(state)) {
+      if (state.memtreeLinkPlacement === "off" &&
+          (state.stableSessionLinks.has(parsed.session_id) || state.newestTrees?.sessionUrl(parsed.session_id))) {
+        publishStatusLink(state, parsed.session_id);
+      } else {
+        state.newestTrees?.peek(parsed.session_id);
+      }
     }
     statusLineShows = url => {
       const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
@@ -4026,9 +4027,10 @@ function viewUrl(url: string): string {
 function sessionLink(
   state: ProxyState,
   sessionId: string | undefined,
-  source: { url: string; index: string; compressed: boolean } | undefined
+  source: { url: string; index: string; compressed: boolean } | undefined,
+  refresh = true
 ): SuccessLink | undefined {
-  const newest = state.newestTrees?.peek(sessionId);
+  const newest = state.newestTrees?.peek(sessionId, refresh);
   // The note suggests /memtree-compact, which cannot run while MemTree is paused.
   const note = source && !source.compressed && state.unpaidDetail() === null
     ? { note: NOT_COMPRESSED_NOTE } : {};
@@ -4046,16 +4048,16 @@ function recapLink(state: ProxyState, sessionId: string | undefined): SuccessLin
   const foreign =
     page !== undefined && sessionId !== undefined &&
     page.sessionId !== undefined && page.sessionId !== sessionId;
-  return sessionLink(state, sessionId, foreign ? undefined : page);
+  return sessionLink(state, sessionId, foreign ? undefined : page, hasLinkDisplay(state));
 }
 
 function nextMemtreeCallSeq(state: ProxyState): number {
   return ++state.memtreeCallSeq;
 }
 
-/** Whether any UI display consumes newest-tree links (notices/trailers/recap, or status line). */
+/** Whether any UI display actively consumes newest-tree lookups (notices/trailers/recap, or a configured/opted-in status line). */
 function hasLinkDisplay(state: ProxyState): boolean {
-  return state.memtreeLinkPlacement !== "off" || state.statusLinks !== undefined;
+  return state.memtreeLinkPlacement !== "off" || (state.statusLinks !== undefined && state.statusLinkRefresh);
 }
 
 /**
@@ -4116,7 +4118,7 @@ function rememberMemtreePage(state: ProxyState, sessionId: string, page: Memtree
  */
 function publishStatusLink(state: ProxyState, sessionId: string): void {
   if (!state.statusLinks) return;
-  const link = stableSessionLink(state, sessionId) ?? currentSessionLink(state, sessionId);
+  const link = stableSessionLink(state, sessionId) ?? currentSessionLink(state, sessionId, false);
   if (link !== undefined) state.statusLinks.write(sessionId, link);
   // Another server's stable link from before a restart, with nothing here to replace it.
   else if (state.newestTrees?.answered(sessionId) && persistedSessionLink(state, sessionId)) {
@@ -4130,7 +4132,7 @@ function publishStatusLink(state: ProxyState, sessionId: string): void {
  */
 function stableSessionLink(state: ProxyState, sessionId: string): string | undefined {
   const known = state.newestTrees?.sessionUrl(sessionId) ?? state.stableSessionLinks.get(sessionId);
-  const fresh = known ?? state.newestTrees?.peek(sessionId)?.sessionUrl;
+  const fresh = known ?? state.newestTrees?.peek(sessionId, false)?.sessionUrl;
   if (fresh === undefined) {
     // A file from before a restart counts only until this server answers (Codex r10).
     return state.newestTrees?.answered(sessionId) ? undefined
@@ -7882,9 +7884,13 @@ function refusalCauseFor(
 }
 
 /** The session's MemTree page (refusal line, status line), as the trailers would show it. */
-function currentSessionLink(state: ProxyState, sessionId: string | undefined): string | undefined {
+function currentSessionLink(
+  state: ProxyState,
+  sessionId: string | undefined,
+  refresh = true
+): string | undefined {
   return sessionId === undefined ? undefined
-    : sessionLink(state, sessionId, currentMemtreePage(state, sessionId))?.link;
+    : sessionLink(state, sessionId, currentMemtreePage(state, sessionId), refresh)?.link;
 }
 
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
@@ -7909,7 +7915,7 @@ function refuseWholeRequest(
       { awaitingIndex: args.rec.indexBehind === true,
         indexSecondsLeft: activeIndexWaits.get(args.rec),
         refusalMessage: refusalMessage(cause!,
-          currentSessionLink(args.state, requestSessionId(args.req)), agentResultNote(args)) });
+          currentSessionLink(args.state, requestSessionId(args.req), hasLinkDisplay(args.state)), agentResultNote(args)) });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   // Nothing went out uncompressed: Claude Code retries it (2026-10-28).

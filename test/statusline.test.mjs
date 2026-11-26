@@ -384,4 +384,50 @@ test("interactive sessions always write status-line link files; refresh follows 
     }),
     { enabled: false, refresh: false }
   );
+
+  // 5. CLI settings flags (--setting-sources, --settings, --bare, --restricted) govern effective config.
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--setting-sources", "user"]), false);
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--setting-sources=user"]), false);
+  assert.deepEqual(
+    resolveStatusLinkConfig({
+      interactive: true, userSettings: noUser.paths.settings, cwd: projectCcc,
+      env: {}, claudeArgs: ["--setting-sources", "user"],
+    }),
+    { enabled: true, refresh: false }
+  );
+  assert.deepEqual(
+    resolveStatusLinkConfig({
+      interactive: true, userSettings: noUser.paths.settings, cwd: projectCcc,
+      env: { CCC_STATUSLINE_REFRESH: "1" }, claudeArgs: ["--setting-sources", "user"],
+    }),
+    { enabled: true, refresh: true }
+  );
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--setting-sources", "user,project"]), true);
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--setting-sources", ""]), false);
+  assert.equal(
+    effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--setting-sources", "project", "--setting-sources", "user"]),
+    false
+  );
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--", "--setting-sources", "user"]), true);
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, projectCcc, ["--model", "--setting-sources", "user"]), true);
+  // Excluding project scope stops a project override from hiding a user-scope `ccc statusline`.
+  assert.equal(effectiveStatusLineWantsLink(autoOff.paths.settings, projectCustom, ["--setting-sources", "user"]), true);
+  // --bare and --restricted skip user/project/local settings files, while --settings still applies.
+  assert.equal(effectiveStatusLineWantsLink(autoOff.paths.settings, projectCcc, ["--bare"]), false);
+  assert.equal(effectiveStatusLineWantsLink(autoOff.paths.settings, projectCcc, ["--restricted"]), false);
+  assert.equal(
+    effectiveStatusLineWantsLink(noUser.paths.settings, emptyCwd, [
+      "--bare", "--settings", JSON.stringify({ statusLine: { type: "command", command: STATUSLINE_COMMAND } }),
+    ]),
+    true
+  );
+  assert.equal(
+    effectiveStatusLineWantsLink(autoOff.paths.settings, projectCcc, [
+      "--settings", JSON.stringify({ statusLine: null }),
+    ]),
+    false
+  );
+  const customSettings = path.join(emptyCwd, "custom-settings.json");
+  fs.writeFileSync(customSettings, JSON.stringify({ statusLine: { type: "command", command: STATUSLINE_COMMAND } }));
+  assert.equal(effectiveStatusLineWantsLink(noUser.paths.settings, emptyCwd, ["--settings", "custom-settings.json"]), true);
 });

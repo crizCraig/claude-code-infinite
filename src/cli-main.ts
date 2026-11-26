@@ -749,7 +749,7 @@ async function main() {
   // Windows), CCC_STATUSLINE_AUTO=0 installs, and project-scope status lines keep working;
   // Stop suppression still requires a recent heartbeat from `ccc statusline`.
   const statusLinkConfig = paths
-    ? resolveStatusLinkConfig({ interactive: true, userSettings: paths.settings })
+    ? resolveStatusLinkConfig({ interactive: true, userSettings: paths.settings, claudeArgs })
     : { enabled: false, refresh: false };
   // A sign-in completed after ccc's warning, between launches or mid-session.
   const signInTracker = new SignInTracker(getConfigDir(),
