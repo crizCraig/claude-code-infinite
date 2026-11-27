@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.0.39](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.38...v1.0.39) (2026-11-26)
+
+
+### Features
+
+* read MemTree from standalone MCP clients (`ccc memtree-mcp --direct`) ([#92](https://github.com/crizCraig/claude-code-infinite/issues/92))
+
+
+### Bug Fixes
+
+* startup banner names Claude Code Infinite first ("∞ Claude Code Infinite · MemTree memory on") ([#89](https://github.com/crizCraig/claude-code-infinite/issues/89))
+* startup security: no bare-name spawns on Windows; typed-ahead text never becomes an API key ([#91](https://github.com/crizCraig/claude-code-infinite/issues/91))
+* install works under Yarn Berry (3/4) again: postinstall no longer fails with ENOEXEC ([#98](https://github.com/crizCraig/claude-code-infinite/pull/98))
+* search guidance makes hybrid the mode for finding things, text for known exact words
+* MemTree browser links stay on the current hosts until the MemTree cutover; fallback checkout asks for confirmation ([#93](https://github.com/crizCraig/claude-code-infinite/issues/93))
+* the per-reply MemTree link is omitted when your status line already shows it ([#96](https://github.com/crizCraig/claude-code-infinite/issues/96))
+* a failed token count is retried instead of compressing history that still fits ([#97](https://github.com/crizCraig/claude-code-infinite/issues/97))
+* direct-mode MemTree registrations only advertise tools that work in that mode ([#98](https://github.com/crizCraig/claude-code-infinite/pull/98))
+
+
 ## [1.0.38](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.37...v1.0.38) (2026-11-15)
 
 
